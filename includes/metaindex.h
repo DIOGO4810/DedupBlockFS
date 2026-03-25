@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define HASH_SIZE 64
 // struct defining the values of the Hashtable
 typedef struct filemeta {
   size_t sizeLogical;

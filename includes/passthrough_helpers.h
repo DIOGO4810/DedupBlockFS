@@ -34,6 +34,7 @@
  * operation
  */
 #define BLOCK_SIZE 4096
+#define HASH_SIZE 64
 static int mknod_wrapper(int dirfd, const char *path, const char *link,
                          int mode, dev_t rdev) {
   int res;

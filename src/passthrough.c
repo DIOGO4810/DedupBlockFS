@@ -22,10 +22,9 @@
  * \include passthrough.c
  */
 
-#include "glib.h"
-#include "glibconfig.h"
-#include <stddef.h>
 #define FUSE_USE_VERSION 31
+#include "glib.h"
+#include <stddef.h>
 
 #define _GNU_SOURCE
 
@@ -33,16 +32,17 @@
 /* For pread()/pwrite()/utimensat() */
 #define _XOPEN_SOURCE 700
 #endif
-
+#include "dedup.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse3/fuse.h>
+#include <fuse.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #ifdef __FreeBSD__
 #include <sys/socket.h>
@@ -78,6 +78,7 @@ typedef struct context {
 static int fill_dir_plus = 0;
 
 static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+
   (void)conn;
   cfg->use_ino = 1;
 
@@ -98,7 +99,11 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
   // Initialize metaindex
   ctx->index = index_init();
-  ctx->masterFd = open("/mnt/fs/masterFILE", O_RDWR);
+
+  ctx->masterFd = open("/masterFILE", O_RDWR | O_CREAT, 0666);
+  struct stat stbuf;
+  lstat("/masterFILE", &stbuf);
+  ctx->sizeMaster = stbuf.st_size;
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -159,6 +164,11 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
 #endif
 
   res = lstat(path, stbuf);
+  size_t *size_pointer = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (size_pointer != NULL) {
+    stbuf->st_size = *size_pointer;
+  }
+
   if (res == -1)
     return -errno;
 
@@ -388,11 +398,13 @@ static int xmp_open(const char *path, struct fuse_file_info *fi) {
 static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi) {
   int fd;
-  int res;
 
-#ifdef DEBUG
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = f_ctx->private_data;
+
+#ifdef DEBUG
+  f_ctx = fuse_get_context();
+  p_ctx = f_ctx->private_data;
   pthread_mutex_lock(&p_ctx->mutex);
   p_ctx->read++;
   printf("[Thread %d] Read for path %s, userid %d, pid %d\n", gettid(), path,
@@ -401,34 +413,39 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
           gettid(), path, f_ctx->uid, f_ctx->pid);
   pthread_mutex_unlock(&p_ctx->mutex);
 #endif
+  // printf("[READ START] tid=%d path=%s uid=%d pid=%d size=%zu offset=%ld\n",
+  //        gettid(), path, f_ctx->uid, f_ctx->pid, size, offset);
 
-  if (fi == NULL) {
+  if (fi == NULL)
     fd = open(path, O_RDONLY);
-  } else {
+  else
     fd = fi->fh;
-  }
 
   if (fd == -1)
     return -errno;
-
-  res = pread(fd, buf, size, offset);
-  if (res == -1)
-    res = -errno;
+  int total_read =
+      read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
 
   if (fi == NULL)
     close(fd);
 
-  return res;
+  return (int)total_read;
 }
 
 static int xmp_write(const char *path, const char *buf, size_t size,
                      off_t offset, struct fuse_file_info *fi) {
   int fd;
-  int res;
+  int res = 0;
 
-#ifdef DEBUG
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = f_ctx->private_data;
+
+  // printf("[WRITE START] tid=%d path=%s uid=%d pid=%d size=%zu offset=%ld\n",
+  //        gettid(), path, f_ctx->uid, f_ctx->pid, size, offset);
+
+#ifdef DEBUG
+  f_ctx = fuse_get_context();
+  p_ctx = f_ctx->private_data;
   pthread_mutex_lock(&p_ctx->mutex);
   p_ctx->write++;
   printf("[Thread %d] Write for path %s, userid %d, pid %d\n", gettid(), path,
@@ -437,7 +454,6 @@ static int xmp_write(const char *path, const char *buf, size_t size,
           gettid(), path, f_ctx->uid, f_ctx->pid);
   pthread_mutex_unlock(&p_ctx->mutex);
 #endif
-
   (void)fi;
   if (fi == NULL)
     fd = open(path, O_WRONLY);
@@ -447,56 +463,12 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
-  size_t num_blocks = size / BLOCK_SIZE;
-  off_t start_block = offset / BLOCK_SIZE;
-  char *hash_bytes = {0};
-  unsigned char *block = {0};
-  for (int i = 0; i < num_blocks; i++) {
-    memcpy(block, buf + i * BLOCK_SIZE, BLOCK_SIZE);
-    hash(block, hash_bytes);
-    BlockIndice *block_index = malloc(sizeof(BlockIndice));
-    block_index->path = path;
-    block_index->offset = start_block + i;
-    g_hash_table_insert(p_ctx->index->file_to_hash, block_index,
-                        strdup(hash_bytes));
-    FileInfo *info =
-        g_hash_table_lookup(p_ctx->index->hash_to_FileInfo, hash_bytes);
-    if (info == NULL) {
-      off_t masterOffset = p_ctx->sizeMaster;
-      if (p_ctx->index->empty_blocks_set) {
-        masterOffset = *(size_t *)p_ctx->index->empty_blocks_set->data;
-        p_ctx->index->empty_blocks_set = g_slist_delete_link(
-            p_ctx->index->empty_blocks_set, p_ctx->index->empty_blocks_set);
-      }
-      FileInfo *info = malloc(sizeof(FileInfo));
-      info->counter = 1;
-      info->offset = masterOffset;
-      size_t bytes_written =
-          pwrite(p_ctx->masterFd, block, BLOCK_SIZE, masterOffset);
-      if (bytes_written != -1)
-        res += bytes_written;
-      p_ctx->sizeMaster += BLOCK_SIZE;
-      g_hash_table_insert(p_ctx->index->hash_to_FileInfo, strdup(hash_bytes),
-                          info);
-    } else {
-      info->counter += 1;
-    }
-  }
-
-  if (res == -1)
-    res = -errno;
+  res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
+                    p_ctx->sizeMaster);
 
   if (fi == NULL)
     close(fd);
 
-  size_t *logical_size;
-  logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
-  if (logical_size == NULL)
-    g_hash_table_insert(p_ctx->index->file_to_sizes, strdup(path),
-                        GINT_TO_POINTER(res));
-  else {
-    *logical_size += res;
-  }
   return res;
 }
 
@@ -673,13 +645,13 @@ static const struct fuse_operations xmp_oper = {
     .mknod = xmp_mknod,
     .mkdir = xmp_mkdir,
     .symlink = xmp_symlink,
-    // .unlink = xmp_unlink, // TODO (extra)
+    .unlink = xmp_unlink, // TODO (extra)
     .rmdir = xmp_rmdir,
-    // .rename = xmp_rename, // TODO (extra)
+    .rename = xmp_rename, // TODO (extra)
     .link = xmp_link,
     .chmod = xmp_chmod,
     .chown = xmp_chown,
-// .truncate = xmp_truncate, // TODO (extra)
+    .truncate = xmp_truncate, // TODO (extra)
 #ifdef HAVE_UTIMENSAT
     .utimens = xmp_utimens,
 #endif

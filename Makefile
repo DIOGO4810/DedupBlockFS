@@ -1,8 +1,8 @@
 CC = gcc
 
-CFLAGS = -Wall -Iincludes `pkg-config --cflags fuse3 glib-2.0`
-LIBS = `pkg-config --libs fuse3 glib-2.0` -lpthread -lbz2
-
+CFLAGS  = -Wall -Iincludes -D_GNU_SOURCE 
+CFLAGS += $(shell pkg-config --cflags fuse3 glib-2.0)
+LIBS   = $(shell pkg-config --libs fuse3 glib-2.0) -lpthread -lbz2 -lcrypto
 SRC = $(wildcard src/*.c)
 OBJ = $(patsubst src/%.c, build/%.o, $(SRC))
 
@@ -13,7 +13,7 @@ build/%.o: src/%.c
 	$(CC) -c $< -o $@ $(CFLAGS)
 
 passthrough: $(OBJ)
-	$(CC) $^ -o $@ $(LIBS)
+	@$(CC) $^ -o $@ $(LIBS)
 
 .PHONY: clean
 
