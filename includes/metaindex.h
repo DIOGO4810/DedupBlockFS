@@ -15,7 +15,7 @@ typedef struct fileInfo {
 } FileInfo;
 
 typedef struct blockIndice {
-  char *path;
+  const char *path;
   size_t offset;
 } BlockIndice;
 
@@ -24,7 +24,7 @@ typedef struct blockIndice {
 typedef struct index {
   GHashTable *hash_to_FileInfo;
   GHashTable *file_to_hash;
-  GHashTable *empty_blocks_set;
+  GSList *empty_blocks_set;
   GHashTable *file_to_sizes;
   pthread_mutex_t mutex;
 } Index;

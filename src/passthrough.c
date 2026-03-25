@@ -22,6 +22,8 @@
  * \include passthrough.c
  */
 
+#include "glib.h"
+#include "glibconfig.h"
 #include <stddef.h>
 #define FUSE_USE_VERSION 31
 
@@ -51,6 +53,7 @@
 #include <sys/xattr.h>
 #endif
 
+#include "hashing.h"
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
@@ -67,7 +70,8 @@ typedef struct context {
   pthread_mutex_t mutex;
   FILE *fp;
   Index *index;
-  Index *lpmap;
+  int masterFd;
+  size_t sizeMaster;
 } Context;
 #endif
 
@@ -94,6 +98,7 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
 
   // Initialize metaindex
   ctx->index = index_init();
+  ctx->masterFd = open("/mnt/fs/masterFILE", O_RDWR);
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -117,6 +122,7 @@ static void xmp_destroy(void *private_data) {
   Context *p_ctx = (Context *)private_data;
   pthread_mutex_destroy(&p_ctx->mutex);
   index_destroy(p_ctx->index);
+  close(p_ctx->masterFd);
 
 #ifdef DEBUG
   printf("[Thread %d] Destroy called, userid %d, pid %d\n", gettid(),
@@ -243,7 +249,7 @@ static int xmp_rmdir(const char *path) {
   res = rmdir(path);
   if (res == -1)
     return -errno;
-  
+
   return 0;
 }
 
@@ -442,19 +448,55 @@ static int xmp_write(const char *path, const char *buf, size_t size,
     return -errno;
 
   size_t num_blocks = size / BLOCK_SIZE;
-  char *hash_bytes;
-  char *block;
+  off_t start_block = offset / BLOCK_SIZE;
+  char *hash_bytes = {0};
+  unsigned char *block = {0};
   for (int i = 0; i < num_blocks; i++) {
     memcpy(block, buf + i * BLOCK_SIZE, BLOCK_SIZE);
     hash(block, hash_bytes);
+    BlockIndice *block_index = malloc(sizeof(BlockIndice));
+    block_index->path = path;
+    block_index->offset = start_block + i;
+    g_hash_table_insert(p_ctx->index->file_to_hash, block_index,
+                        strdup(hash_bytes));
+    FileInfo *info =
+        g_hash_table_lookup(p_ctx->index->hash_to_FileInfo, hash_bytes);
+    if (info == NULL) {
+      off_t masterOffset = p_ctx->sizeMaster;
+      if (p_ctx->index->empty_blocks_set) {
+        masterOffset = *(size_t *)p_ctx->index->empty_blocks_set->data;
+        p_ctx->index->empty_blocks_set = g_slist_delete_link(
+            p_ctx->index->empty_blocks_set, p_ctx->index->empty_blocks_set);
+      }
+      FileInfo *info = malloc(sizeof(FileInfo));
+      info->counter = 1;
+      info->offset = masterOffset;
+      size_t bytes_written =
+          pwrite(p_ctx->masterFd, block, BLOCK_SIZE, masterOffset);
+      if (bytes_written != -1)
+        res += bytes_written;
+      p_ctx->sizeMaster += BLOCK_SIZE;
+      g_hash_table_insert(p_ctx->index->hash_to_FileInfo, strdup(hash_bytes),
+                          info);
+    } else {
+      info->counter += 1;
+    }
   }
 
-  res = pwrite(fd, buf, size, offset);
   if (res == -1)
     res = -errno;
 
   if (fi == NULL)
     close(fd);
+
+  size_t *logical_size;
+  logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (logical_size == NULL)
+    g_hash_table_insert(p_ctx->index->file_to_sizes, strdup(path),
+                        GINT_TO_POINTER(res));
+  else {
+    *logical_size += res;
+  }
   return res;
 }
 
