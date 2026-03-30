@@ -1,50 +1,57 @@
+#ifndef METAINDEX_H
+#define METAINDEX_H
+
 #include <glib.h>
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #define HASH_SIZE 64
-// struct defining the values of the Hashtable
-typedef struct filemeta {
-  size_t sizeLogical;
-  size_t sizeFisico;
-} Filemeta;
 
-typedef struct fileInfo {
-  size_t offset;
-  size_t counter;
-} FileInfo;
+// MasterInfo represents a unique physical block in the Masterfile.
+// Two indices point to MasterInfo:
+//  - (file, logical block) -> MasterInfo*
+//  - hash -> MasterInfo*
+// This enables O(1) deduplication and avoids reading the Masterfile during
+// removals.
+typedef struct masterInfo {
+  unsigned char hash[HASH_SIZE]; // SHA-512 hash of the block content
+  uint64_t masterBlockIndex;     // block index in the Masterfile (byte offset =
+                                 // masterBlockIndex * BLOCK_SIZE)
+  uint32_t refcount; // number of logical (file, block) references
+} MasterInfo;
 
 typedef struct blockIndice {
   const char *path;
-  size_t offset;
+  size_t offset; // logical block index
 } BlockIndice;
 
-// structure containing the hashtable structure, global mutex and condition
-// variable
+// Main index structure containing both indices and the free block list.
 typedef struct index {
-  GHashTable *hash_to_FileInfo;
-  GHashTable *file_to_hash;
-  GSList *empty_blocks_set;
-  GHashTable *file_to_sizes;
+  GHashTable *hash_to_master; // hash (unsigned char[64]) -> MasterInfo*
+  GHashTable *file_to_master; // BlockIndice* -> MasterInfo*
+  GSList *free_block_list;    // list of uint64_t* (reusable masterBlockIndex)
+  GHashTable *file_to_sizes;  // path (char*) -> size_t* (logical file size)
   pthread_mutex_t mutex;
 } Index;
 
-// Initializes the index structure
-// Returns NULL in case of failure and a pointer to the struct otherwise
-Index *index_init();
+// Initializes the index structure.
+// Returns NULL in case of failure and a pointer to the struct otherwise.
+Index *index_init(void);
 
-// Adds a new key-value entry into the Hashtable
-// Returns -1 in case of failure (or if the key already exists) and 0 otherwise
-int index_add(Index *index, char *key, Filemeta meta);
-
-// Get the value (meta) for a specific key (key)
-// Returns -1 in case of failure (or if the key does not exists) and 0 otherwise
-int index_get(Index *index, char *key, Filemeta *meta);
-
-// Remove a key-value entry from the Hashtable
-// Returns -1 in case of failure (or if the key does not exists) and 0 otherwise
-int index_remove(Index *index, char *key);
-
-// Destroys the index structure
+// Destroys the index structure and frees all MasterInfo objects.
 void index_destroy(Index *index);
+
+// Logical index: (file, blockIndex) -> MasterInfo*
+MasterInfo *lookup_by_file_block(Index *index, const char *file,
+                                 uint64_t blockIndex);
+void insert_file_block(Index *index, const char *file, uint64_t blockIndex,
+                       MasterInfo *info);
+void remove_file_block(Index *index, const char *file, uint64_t blockIndex);
+
+// Hash index: hash -> MasterInfo*
+MasterInfo *lookup_by_hash(Index *index, const unsigned char *hash);
+void insert_hash(Index *index, const unsigned char *hash, MasterInfo *info);
+void remove_hash(Index *index, const unsigned char *hash);
+
+#endif

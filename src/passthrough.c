@@ -71,7 +71,7 @@ typedef struct context {
   FILE *fp;
   Index *index;
   int masterFd;
-  size_t sizeMaster;
+  uint64_t nextBlockIndex;
 } Context;
 #endif
 
@@ -103,7 +103,7 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   ctx->masterFd = open("/masterFILE", O_RDWR | O_CREAT, 0666);
   struct stat stbuf;
   lstat("/masterFILE", &stbuf);
-  ctx->sizeMaster = stbuf.st_size;
+  ctx->nextBlockIndex = stbuf.st_size / BLOCK_SIZE;
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -233,10 +233,29 @@ static int xmp_mknod(const char *path, mode_t mode, dev_t rdev) {
   return 0;
 }
 
+// When a file is deleted, we need to clean up all its dedup metadata:
+// decrement refcounts, free blocks that are no longer referenced,
+// and then actually delete the file from the filesystem.
 static int xmp_unlink(const char *path) {
-  int res;
+  struct fuse_context *f_ctx = fuse_get_context();
+  Context *p_ctx = (Context *)f_ctx->private_data;
 
-  res = unlink(path);
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  size_t *logical_size =
+      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (logical_size != NULL) {
+    // walk through every block of the file and remove its reference
+    uint64_t num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (uint64_t i = 0; i < num_blocks; i++) {
+      remove_block_dedup(p_ctx->index, path, i);
+    }
+    // remove the file size entry itself
+    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+  }
+  pthread_mutex_unlock(&p_ctx->index->mutex);
+
+  // now actually delete the file
+  int res = unlink(path);
   if (res == -1)
     return -errno;
 
@@ -319,10 +338,28 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid,
   return 0;
 }
 
+// When a file is truncated, remove dedup references for the blocks
+// that are now beyond the new size, then shrink the actual file.
 static int xmp_truncate(const char *path, off_t size,
                         struct fuse_file_info *fi) {
-  int res;
+  struct fuse_context *f_ctx = fuse_get_context();
+  Context *p_ctx = (Context *)f_ctx->private_data;
 
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  size_t *logical_size =
+      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (logical_size != NULL && (size_t)size < *logical_size) {
+    // only the blocks past the new size need to be removed
+    uint64_t new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint64_t old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (uint64_t i = new_block_count; i < old_block_count; i++) {
+      remove_block_dedup(p_ctx->index, path, i);
+    }
+    *logical_size = size;
+  }
+  pthread_mutex_unlock(&p_ctx->index->mutex);
+
+  int res;
   if (fi != NULL)
     res = ftruncate(fi->fh, size);
   else
@@ -423,8 +460,12 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
 
   if (fd == -1)
     return -errno;
+
+  // read from the master file through the dedup layer
+  pthread_mutex_lock(&p_ctx->index->mutex);
   int total_read =
       read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
+  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);
@@ -463,8 +504,11 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
+  // write through the dedup layer (handles dedup + overwrite)
+  pthread_mutex_lock(&p_ctx->index->mutex);
   res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
-                    p_ctx->sizeMaster);
+                    &p_ctx->nextBlockIndex);
+  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);
