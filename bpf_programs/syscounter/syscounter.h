@@ -11,6 +11,7 @@
 
 #define MAX_OPS 6
 #define MAX_PIDS 100
+#define MAX_THREADS 16
 
 // Define a struct to be used as key for the counter map, which includes the pid, command and the syscall id (op)
 typedef struct counter_key {
@@ -21,8 +22,7 @@ typedef struct counter_key {
 
 typedef struct counter_value {
 	long count;
-	long enter_time_sum;
-	long exit_time_sum;
+	long time_sum;
 } CounterValue;
 
 #endif

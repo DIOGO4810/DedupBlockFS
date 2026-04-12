@@ -16,13 +16,23 @@ struct {
     __type(value, u32);
 } pids_to_consider SEC(".maps");
 
-// Define a map to store the counters for each pid and syscall
+// map to store temporary entries
+// the key is just the tid because a thread can't do multiple syscalls at the same time, that is,
+// if it enters one, it must exit before entering another one
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_PIDS*MAX_THREADS);
+	__type(key, u32);
+	__type(value, u64);
+} enter_timestamps SEC(".maps");
+
+// Define a map to store the final counters for each pid and syscall
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, MAX_PIDS*MAX_OPS);
     __type(key, CounterKey);
     __type(value, CounterValue);
-} counter SEC(".maps");
+} counters SEC(".maps");
 
 
 /* Function to check if pid is on pids_to_consider map or not
@@ -39,6 +49,7 @@ int to_discard (u32 pid) { // 1 - discard, 0 - collect
  * Returns the corresponding struct file* or NULL
  */
 struct file* get_file_from_fd(int fd) {
+	if (fd < 0) return NULL;
     struct task_struct *ts = (struct task_struct*)bpf_get_current_task();
     struct file **fd_array = BPF_CORE_READ(ts, files, fdt, fd);
     struct file *file;
@@ -66,50 +77,53 @@ int check_file_mode_from_file(struct file *file) {
     return check_file_mode(mode);
 }
 
-/* Function to update the counter for a given pid and syscall when entering the syscall
- * Receives a pid (u32 pid) and a syscall id (int op) as arguments
+/* This function saves the enter timestamp for a given thread.
+ * The op id isn't needed because a single thread can only perform one syscall at a time.
  * Returns 0 on success or 1 on failure
  */
-int update_counter_enter(u32 pid, int op) {
+int update_counter_enter(u32 tid) {
 
-    CounterKey key = {
-        .pid = pid,
-        .op = op
-    };
-    bpf_get_current_comm(&key.command, sizeof(key.command));
 	u64 timestamp = bpf_ktime_get_ns();
 
-    // First try to lookup the value for this key.
-	// If found, increment the counter by 1 and save the timestamp.
-    CounterValue *val = bpf_map_lookup_elem(&counter, &key);
-    if (val) {
-        __sync_fetch_and_add(&val->count, 1);
-		__sync_fetch_and_add(&val->enter_time_sum, timestamp);
-        return 0;
-    }
-
-    // If not found, insert with initial values
-	CounterValue new = {1, timestamp, 0};
-    bpf_map_update_elem(&counter, &key, &new, BPF_NOEXIST);
+    // always insert even if there was a value already
+	// this way, we ignore enters that never got their respective exit for some reason
+	bpf_map_update_elem(&enter_timestamps, &tid, &timestamp, BPF_ANY);
     return 0;
 }
 
 /*
- * Similar to the one above, but for exiting the syscall
+ * This one takes the timestamp stored in update_counter_enter for the given thread and calculates the delta.
+ * The final result is stored by pid, command and op. 
+ * If it didn't exist, we just ignore it, so we don't introduce time measuring errors.
  */
-int update_counter_exit(u32 pid, int op) {
+int update_counter_exit(u32 pid, u32 tid, int op) {
 
     CounterKey key = {
         .pid = pid,
         .op = op
     };
     bpf_get_current_comm(&key.command, sizeof(key.command));
-	u64 timestamp = bpf_ktime_get_ns();
 
-	// lookup the value to save the exit timestamp
-    CounterValue *val = bpf_map_lookup_elem(&counter, &key);
-    if (val) {
-		__sync_fetch_and_add(&val->exit_time_sum, timestamp);
+    u64 *enter_time = bpf_map_lookup_elem(&enter_timestamps, &tid);
+    if (enter_time) {
+		// delete the entry to avoid possible exits without a corresponding enter performing erroneous calculations
+		bpf_map_delete_elem(&enter_timestamps, &tid);
+		
+		CounterValue *value = bpf_map_lookup_elem(&counters, &key);
+
+		u64 timestamp = bpf_ktime_get_ns();
+		u64 delta = timestamp - *enter_time;
+	
+		// if entry is NULL, it's the first time this key is being updated
+		if (value == NULL) {
+			CounterValue new = {1, delta};
+			bpf_map_update_elem(&counters, &key, &new, BPF_NOEXIST);
+		}
+		else {
+			__sync_fetch_and_add(&value->time_sum, delta);
+			__sync_fetch_and_add(&value->count, 1);
+		}
+
         return 0;
     }
 	
@@ -125,20 +139,33 @@ int BPF_PROG(sys_enter_openat, struct pt_regs *regs, int syscall_id, int dfd,
 			 const char * filename, int flags, umode_t mode) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // update counter for this pid and syscall openat
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_openat")
 int BPF_PROG(sys_exit_openat, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
+
+    // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
+    struct file *file = get_file_from_fd(ret);
+    if (file != NULL && check_file_mode_from_file(file)) {
+		// if this fd is not from a file, delete the entry in the timestamp map to avoid
+		// filling it with non-file entries
+		bpf_map_delete_elem(&enter_timestamps, &tid);
+		return 0;
+	}
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 SEC("tp/syscalls/sys_enter_write")
@@ -146,7 +173,9 @@ int BPF_PROG(sys_enter_write, struct pt_regs *regs, long syscall_id, u32 fd,
 			 char *buf, size_t count) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
@@ -154,16 +183,18 @@ int BPF_PROG(sys_enter_write, struct pt_regs *regs, long syscall_id, u32 fd,
     if (check_file_mode_from_file(file)) return 0;
 
     // update counter for this pid and syscall write
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_write")
 int BPF_PROG(sys_exit_write, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 SEC("tp/syscalls/sys_enter_pwrite64")
@@ -171,7 +202,9 @@ int BPF_PROG(sys_enter_pwrite64, struct pt_regs *regs, long syscall_id, u32 fd,
 			 char *buf, size_t count) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
@@ -179,16 +212,18 @@ int BPF_PROG(sys_enter_pwrite64, struct pt_regs *regs, long syscall_id, u32 fd,
     if (check_file_mode_from_file(file)) return 0;
 
     // update counter for this pid and syscall pwrite64
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_pwrite64")
 int BPF_PROG(sys_exit_pwrite64, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 SEC("tp/syscalls/sys_enter_read")
@@ -196,7 +231,9 @@ int BPF_PROG(sys_enter_read, struct pt_regs *regs, long syscall_id, u32 fd,
 			 char *buf, size_t count) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
@@ -204,16 +241,18 @@ int BPF_PROG(sys_enter_read, struct pt_regs *regs, long syscall_id, u32 fd,
     if (check_file_mode_from_file(file)) return 0;
 
     // update counter for this pid and syscall read
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_read")
 int BPF_PROG(sys_exit_read, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 SEC("tp/syscalls/sys_enter_pread64")
@@ -221,7 +260,9 @@ int BPF_PROG(sys_enter_pread64, struct pt_regs *regs, long syscall_id, u32 fd,
 			 char *buf, size_t count) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
@@ -229,23 +270,27 @@ int BPF_PROG(sys_enter_pread64, struct pt_regs *regs, long syscall_id, u32 fd,
     if (check_file_mode_from_file(file)) return 0;
 
     // update counter for this pid and syscall pread64
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_pread64")
 int BPF_PROG(sys_exit_pread64, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 SEC("tp/syscalls/sys_enter_close")
 int BPF_PROG(sys_enter_close, struct pt_regs *regs, long syscall_id, u32 fd) {
 
     // check if the pid is in the filter list or not. If not, return 0 to ignore this event.
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 
     // get file path from fd and check if it is a regular file. If not, return 0 to ignore this event.
@@ -253,16 +298,18 @@ int BPF_PROG(sys_enter_close, struct pt_regs *regs, long syscall_id, u32 fd) {
     if (check_file_mode_from_file(file)) return 0;
 
     // update counter for this pid and syscall close
-    return update_counter_enter(pid, syscall_id);
+    return update_counter_enter(tid);
 }
 
 SEC("tp/syscalls/sys_exit_close")
 int BPF_PROG(sys_exit_close, struct pt_regs *regs, int syscall_id, long ret) {
 
-    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    u64 pidtid = bpf_get_current_pid_tgid();
+	u32 pid = pidtid >> 32;
+	u32 tid = pidtid;
     if (to_discard(pid)) return 0;
 	
-	return update_counter_exit(pid, syscall_id);
+	return update_counter_exit(pid, tid, syscall_id);
 }
 
 /* ----PROC-----  */

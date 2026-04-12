@@ -43,7 +43,7 @@ int get_values_from_counter_map(struct syscounter_bpf *skel, CounterKey *keys, C
 	CounterValue value;
 
 	// Start with NULL to get first key
-	if (bpf_map__get_next_key(skel->maps.counter, NULL, &next_key, sizeof(next_key)) != 0) {
+	if (bpf_map__get_next_key(skel->maps.counters, NULL, &next_key, sizeof(next_key)) != 0) {
 		printf("Map is empty\n");
 		return num_entries;
 	}
@@ -51,7 +51,7 @@ int get_values_from_counter_map(struct syscounter_bpf *skel, CounterKey *keys, C
 	// Iterate through the map using get_next_key until there are no more keys
 	cur_key = next_key;
 	while (1) {
-		if (bpf_map__lookup_elem(skel->maps.counter, &cur_key, sizeof(cur_key), &value, sizeof(value), BPF_ANY) == 0) {
+		if (bpf_map__lookup_elem(skel->maps.counters, &cur_key, sizeof(cur_key), &value, sizeof(value), BPF_ANY) == 0) {
 			// Store the key and value in the provided arrays
 			keys[num_entries] = cur_key;
 			values[num_entries] = value;
@@ -59,7 +59,7 @@ int get_values_from_counter_map(struct syscounter_bpf *skel, CounterKey *keys, C
 		}
 
 		// Get next key
-		if (bpf_map__get_next_key(skel->maps.counter, &cur_key, &next_key, sizeof(next_key)) != 0)
+		if (bpf_map__get_next_key(skel->maps.counters, &cur_key, &next_key, sizeof(next_key)) != 0)
 			break;
 
 		cur_key = next_key;
@@ -146,14 +146,13 @@ void print_results(CounterKey *keys, CounterValue *values, int num_entries, char
 				snprintf(comm, COMM_STR_LEN, "%s-%d", keys[k].command, keys[k].pid);
 				if ((strcmp(comm,pid_list[j])==0) && keys[k].op == op_list[i]) {
 					val = values[k];
-					total_op_list[i].count += values[k].count;
-					total_op_list[i].enter_time_sum += values[k].enter_time_sum;
-					total_op_list[i].exit_time_sum += values[k].exit_time_sum;
+					total_op_list[i].count += val.count;
+					total_op_list[i].time_sum += val.time_sum;
 				}
 			}
-			long delta = (val.exit_time_sum - val.enter_time_sum) / 1e6;  // milliseconds
+			long time = val.time_sum / 1e6;  // milliseconds
 			char cell[20];
-			snprintf(cell, sizeof(cell), "%03ldx | %ldms", val.count, delta);
+			snprintf(cell, sizeof(cell), "%06ldx | %ldms", val.count, time);
 			printf("%-20s", cell);
 		}
 		printf("\n");
@@ -165,9 +164,9 @@ void print_results(CounterKey *keys, CounterValue *values, int num_entries, char
 
 	printf("%-32s", "Total");
 	for (int i = 0; i < op_count; i++) {
-		long delta = (total_op_list[i].exit_time_sum - total_op_list[i].enter_time_sum) / 1e6;  // milliseconds
+		long time = total_op_list[i].time_sum / 1e6;  // milliseconds
 		char cell[20];
-		snprintf(cell, sizeof(cell), "%03ldx | %ldms", total_op_list[i].count, delta);
+		snprintf(cell, sizeof(cell), "%06ldx | %ldms", total_op_list[i].count, time);
 		printf("%-20s", cell);
 	}
 	printf("\n");
