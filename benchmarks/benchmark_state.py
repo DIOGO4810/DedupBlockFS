@@ -17,11 +17,14 @@ class State():
         self.num_files: int = config["num_files"]
         self.num_unique_dup_blocks: int = config["num_unique_dup_blocks"]
 
-        # prepare buffers
+        # file tracking
 
-        self.files: list[int] = []
-        for _ in range(self.num_files):
-            self.files.append(-1)
+        self.files: list[dict[str,int|str]] = [
+            {"fd": -1, "path": f"test_file{i}", "size": 0}
+            for i in range(self.num_files)
+        ]
+
+        # prepare memory buffers
 
         self.dup_blocks: list[bytearray] = []
         for i in range(self.num_unique_dup_blocks):
@@ -41,6 +44,7 @@ class State():
 
         # this buffer is reused everytime we want to build a write request, so it has the maximum capacity
         self.buffer: bytearray = bytearray(4096*self.block_range[1])
+        self.buffer_mv: memoryview = memoryview(self.buffer)
 
     def get_num_blocks(self) -> int:
         """
@@ -55,16 +59,11 @@ class State():
         dup_rand = random.randint(0, 100)
         return dup_rand < self.dup_pcnt
 
-    def get_random_fd(self) -> int:
+    def get_random_file(self) -> dict[str,int|str]:
         """
-        Returns the file descriptor of a random test file.
+        Returns the file dictionary of a random test file.
         """
-        file_index = random.randint(0, len(self.files)-1)
-        fd = self.files[file_index]
-        if fd == -1:
-            fd = os.open(f"test_file{file_index}", os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode=666)
-            self.files[file_index] = fd
-        return fd
+        return random.choice(self.files)
 
     def append_dup_block(self, block_index: int):
         """
@@ -80,7 +79,6 @@ class State():
         """
         Appends a unique block to the internal buffer and updates the unique block.
         """
-        unq_block = self.unique_block
         start = block_index * 4096
         end = start + 4096
         self.buffer[start:end] = self.unique_block
@@ -98,10 +96,10 @@ class State():
         """
         Returns a memoryview of the reusable buffer, sliced to the according size.
         """
-        return memoryview(self.buffer)[:size]
+        return self.buffer_mv[:size]
 
     def free(self):
-        for fd in self.files:
-            if fd != -1:
-                os.close(fd)
+        for file in self.files:
+            if file["fd"] != -1:
+                os.close(file["fd"])
 

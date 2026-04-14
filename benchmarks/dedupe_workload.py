@@ -42,6 +42,7 @@ def write(state: State):
     # first build the whole request in a single buffer
     
     num_blocks = state.get_num_blocks()
+    num_bytes = num_blocks * 4096
 
     for i in range(num_blocks):
 
@@ -53,17 +54,54 @@ def write(state: State):
             state.append_unique_block(i)
 
     # now execute the write operation at once
-    fd = state.get_random_fd()
-    buf = state.get_buffer(num_blocks*4096)
-    os.write(fd, buf)
+    file = state.get_random_file()
+    if file["fd"] == -1:
+        file["fd"] = os.open(file["path"], os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=666)
+    buf = state.get_buffer(num_blocks * 4096)
+    bytes_written = os.write(file["fd"], buf)
+    if bytes_written != num_bytes:
+        print("Number of bytes written doesn't match the expected!")
+
+    # update the file info
+    file["size"] += num_bytes
 
 
 def read(state: State):
-    """Execute a read operation."""
+    """
+    Executes a read operation on a random file.
+    Reads a random number (between the configured range) of blocks at a random offset.
+    """
+
+    file = state.get_random_file()
+    fd = file["fd"]
+
+    num_blocks = state.get_num_blocks()
+    max_blocks = file["size"] // 4096
+
+    num_blocks = min(num_blocks, max_blocks)
+    max_offset_blocks = max_blocks - num_blocks
+    block_offset = random.randint(0, max_offset_blocks)
+
+    offset = block_offset * 4096
+    size = num_blocks * 4096
+    buf = state.get_buffer(size)
+
+    _ = os.pread(fd, size, offset)
 
 
 def unlink(state: State):
-    """Execute an unlink operation."""
+    """
+    Executes an unlink operation on a random file, closing the file descriptor.
+    """
+
+    file = state.get_random_file()
+
+    _ = os.close(file["fd"])
+    _ = os.unlink(file["path"])
+
+    file["fd"] = -1
+    file["size"] = 0
+
 
 
 def workload(state: State):
