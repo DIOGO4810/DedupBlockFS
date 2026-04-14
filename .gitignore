@@ -3,6 +3,8 @@ passthrough
 .cache
 build
 .vscode/c_cpp_properties.json
+*.md
+.claude
 *.o
 bpf_programs/cachestat/cachestat
 bpf_programs/cachestat/cachestat.skel.h

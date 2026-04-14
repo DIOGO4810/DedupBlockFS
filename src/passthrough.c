@@ -22,8 +22,9 @@
  * \include passthrough.c
  */
 
-#include <stddef.h>
 #define FUSE_USE_VERSION 31
+#include "glib.h"
+#include <stddef.h>
 
 #define _GNU_SOURCE
 
@@ -35,12 +36,13 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fuse3/fuse.h>
+#include <fuse.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #ifdef __FreeBSD__
 #include <sys/socket.h>
@@ -51,14 +53,14 @@
 #include <sys/xattr.h>
 #endif
 
+#include "hashing.h"
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
 #define DEBUG "/tmp/debug.log"
 
 #ifdef DEBUG
-typedef struct context
-{
+typedef struct context {
   uint64_t create;
   uint64_t open;
   uint64_t close;
@@ -68,14 +70,15 @@ typedef struct context
   pthread_mutex_t mutex;
   FILE *fp;
   Index *index;
-  Index *lpmap;
+  int masterFd;
+  uint64_t nextBlockIndex;
 } Context;
 #endif
 
 static int fill_dir_plus = 0;
 
-static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
-{
+static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
+
   (void)conn;
   cfg->use_ino = 1;
 
@@ -97,6 +100,11 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
   // Initialize metaindex
   ctx->index = index_init();
 
+  ctx->masterFd = open("/masterFILE", O_RDWR | O_CREAT, 0666);
+  struct stat stbuf;
+  lstat("/masterFILE", &stbuf);
+  ctx->nextBlockIndex = stbuf.st_size / BLOCK_SIZE;
+
 #ifdef DEBUG
   ctx->open = 0;
   ctx->close = 0;
@@ -113,13 +121,13 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg)
   return ctx;
 }
 
-static void xmp_destroy(void *private_data)
-{
+static void xmp_destroy(void *private_data) {
 
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)private_data;
   pthread_mutex_destroy(&p_ctx->mutex);
   index_destroy(p_ctx->index);
+  close(p_ctx->masterFd);
 
 #ifdef DEBUG
   printf("[Thread %d] Destroy called, userid %d, pid %d\n", gettid(),
@@ -140,8 +148,7 @@ static void xmp_destroy(void *private_data)
 }
 
 static int xmp_getattr(const char *path, struct stat *stbuf,
-                       struct fuse_file_info *fi)
-{
+                       struct fuse_file_info *fi) {
   (void)fi;
   int res;
 
@@ -157,14 +164,18 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
 #endif
 
   res = lstat(path, stbuf);
+  size_t *size_pointer = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (size_pointer != NULL) {
+    stbuf->st_size = *size_pointer;
+  }
+
   if (res == -1)
     return -errno;
 
   return 0;
 }
 
-static int xmp_access(const char *path, int mask)
-{
+static int xmp_access(const char *path, int mask) {
   int res;
 
   res = access(path, mask);
@@ -174,8 +185,7 @@ static int xmp_access(const char *path, int mask)
   return 0;
 }
 
-static int xmp_readlink(const char *path, char *buf, size_t size)
-{
+static int xmp_readlink(const char *path, char *buf, size_t size) {
   int res;
 
   res = readlink(path, buf, size - 1);
@@ -188,8 +198,7 @@ static int xmp_readlink(const char *path, char *buf, size_t size)
 
 static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                        off_t offset, struct fuse_file_info *fi,
-                       enum fuse_readdir_flags flags)
-{
+                       enum fuse_readdir_flags flags) {
   DIR *dp;
   struct dirent *de;
 
@@ -201,8 +210,7 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
   if (dp == NULL)
     return -errno;
 
-  while ((de = readdir(dp)) != NULL)
-  {
+  while ((de = readdir(dp)) != NULL) {
     struct stat st;
     memset(&st, 0, sizeof(st));
     st.st_ino = de->d_ino;
@@ -215,8 +223,7 @@ static int xmp_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
   return 0;
 }
 
-static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
-{
+static int xmp_mknod(const char *path, mode_t mode, dev_t rdev) {
   int res;
 
   res = mknod_wrapper(AT_FDCWD, path, NULL, mode, rdev);
@@ -226,19 +233,36 @@ static int xmp_mknod(const char *path, mode_t mode, dev_t rdev)
   return 0;
 }
 
-static int xmp_unlink(const char *path)
-{
-  int res;
+// When a file is deleted, we need to clean up all its dedup metadata:
+// decrement refcounts, free blocks that are no longer referenced,
+// and then actually delete the file from the filesystem.
+static int xmp_unlink(const char *path) {
+  struct fuse_context *f_ctx = fuse_get_context();
+  Context *p_ctx = (Context *)f_ctx->private_data;
 
-  res = unlink(path);
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  size_t *logical_size =
+      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (logical_size != NULL) {
+    // walk through every block of the file and remove its reference
+    uint64_t num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (uint64_t i = 0; i < num_blocks; i++) {
+      remove_block_dedup(p_ctx->index, path, i);
+    }
+    // remove the file size entry itself
+    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+  }
+  pthread_mutex_unlock(&p_ctx->index->mutex);
+
+  // now actually delete the file
+  int res = unlink(path);
   if (res == -1)
     return -errno;
 
   return 0;
 }
 
-static int xmp_mkdir(const char *path, mode_t mode)
-{
+static int xmp_mkdir(const char *path, mode_t mode) {
   int res;
 
   res = mkdir(path, mode);
@@ -248,8 +272,7 @@ static int xmp_mkdir(const char *path, mode_t mode)
   return 0;
 }
 
-static int xmp_rmdir(const char *path)
-{
+static int xmp_rmdir(const char *path) {
   int res;
 
   res = rmdir(path);
@@ -259,8 +282,7 @@ static int xmp_rmdir(const char *path)
   return 0;
 }
 
-static int xmp_symlink(const char *from, const char *to)
-{
+static int xmp_symlink(const char *from, const char *to) {
   int res;
 
   res = symlink(from, to);
@@ -270,8 +292,7 @@ static int xmp_symlink(const char *from, const char *to)
   return 0;
 }
 
-static int xmp_rename(const char *from, const char *to, unsigned int flags)
-{
+static int xmp_rename(const char *from, const char *to, unsigned int flags) {
   int res;
 
   if (flags)
@@ -284,8 +305,7 @@ static int xmp_rename(const char *from, const char *to, unsigned int flags)
   return 0;
 }
 
-static int xmp_link(const char *from, const char *to)
-{
+static int xmp_link(const char *from, const char *to) {
   int res;
 
   res = link(from, to);
@@ -295,8 +315,7 @@ static int xmp_link(const char *from, const char *to)
   return 0;
 }
 
-static int xmp_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
-{
+static int xmp_chmod(const char *path, mode_t mode, struct fuse_file_info *fi) {
   (void)fi;
   int res;
 
@@ -308,8 +327,7 @@ static int xmp_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
 }
 
 static int xmp_chown(const char *path, uid_t uid, gid_t gid,
-                     struct fuse_file_info *fi)
-{
+                     struct fuse_file_info *fi) {
   (void)fi;
   int res;
 
@@ -320,11 +338,28 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid,
   return 0;
 }
 
+// When a file is truncated, remove dedup references for the blocks
+// that are now beyond the new size, then shrink the actual file.
 static int xmp_truncate(const char *path, off_t size,
-                        struct fuse_file_info *fi)
-{
-  int res;
+                        struct fuse_file_info *fi) {
+  struct fuse_context *f_ctx = fuse_get_context();
+  Context *p_ctx = (Context *)f_ctx->private_data;
 
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  size_t *logical_size =
+      g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  if (logical_size != NULL && (size_t)size < *logical_size) {
+    // only the blocks past the new size need to be removed
+    uint64_t new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    uint64_t old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    for (uint64_t i = new_block_count; i < old_block_count; i++) {
+      remove_block_dedup(p_ctx->index, path, i);
+    }
+    *logical_size = size;
+  }
+  pthread_mutex_unlock(&p_ctx->index->mutex);
+
+  int res;
   if (fi != NULL)
     res = ftruncate(fi->fh, size);
   else
@@ -337,8 +372,7 @@ static int xmp_truncate(const char *path, off_t size,
 
 #ifdef HAVE_UTIMENSAT
 static int xmp_utimens(const char *path, const struct timespec ts[2],
-                       struct fuse_file_info *fi)
-{
+                       struct fuse_file_info *fi) {
   (void)fi;
   int res;
 
@@ -352,8 +386,7 @@ static int xmp_utimens(const char *path, const struct timespec ts[2],
 #endif
 
 static int xmp_create(const char *path, mode_t mode,
-                      struct fuse_file_info *fi)
-{
+                      struct fuse_file_info *fi) {
   int res;
 
 #ifdef DEBUG
@@ -376,8 +409,7 @@ static int xmp_create(const char *path, mode_t mode,
   return 0;
 }
 
-static int xmp_open(const char *path, struct fuse_file_info *fi)
-{
+static int xmp_open(const char *path, struct fuse_file_info *fi) {
   int res;
 
   struct fuse_context *f_ctx = fuse_get_context();
@@ -401,15 +433,15 @@ static int xmp_open(const char *path, struct fuse_file_info *fi)
 }
 
 static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
-                    struct fuse_file_info *fi)
-{
+                    struct fuse_file_info *fi) {
   int fd;
-  ssize_t res;
-  ssize_t total_read = 0;
 
-#ifdef DEBUG
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = f_ctx->private_data;
+
+#ifdef DEBUG
+  f_ctx = fuse_get_context();
+  p_ctx = f_ctx->private_data;
   pthread_mutex_lock(&p_ctx->mutex);
   p_ctx->read++;
   printf("[Thread %d] Read for path %s, userid %d, pid %d\n", gettid(), path,
@@ -418,6 +450,8 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
           gettid(), path, f_ctx->uid, f_ctx->pid);
   pthread_mutex_unlock(&p_ctx->mutex);
 #endif
+  // printf("[READ START] tid=%d path=%s uid=%d pid=%d size=%zu offset=%ld\n",
+  //        gettid(), path, f_ctx->uid, f_ctx->pid, size, offset);
 
   if (fi == NULL)
     fd = open(path, O_RDONLY);
@@ -427,25 +461,11 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
   if (fd == -1)
     return -errno;
 
-  Index *index = p_ctx->index;
-
-  for (size_t i = 0; i < size / BLOCK_SIZE; i++)
-  {
-    char buff[BLOCK_SIZE];
-    res = read_block(path, offset + i * BLOCK_SIZE, buff, index);
-    if (res == -1)
-    {
-      res = pread(fd, buff, BLOCK_SIZE, offset + i * BLOCK_SIZE);
-      if (res == -1)
-      {
-        if (fi == NULL)
-          close(fd);
-        return -errno;
-      }
-    }
-    memcpy(buf + i * BLOCK_SIZE, buff, BLOCK_SIZE);
-    total_read += BLOCK_SIZE;
-  }
+  // read from the master file through the dedup layer
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  int total_read =
+      read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
+  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);
@@ -454,14 +474,19 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
 }
 
 static int xmp_write(const char *path, const char *buf, size_t size,
-                     off_t offset, struct fuse_file_info *fi)
-{
+                     off_t offset, struct fuse_file_info *fi) {
   int fd;
-  int res;
+  int res = 0;
 
-#ifdef DEBUG
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = f_ctx->private_data;
+
+  // printf("[WRITE START] tid=%d path=%s uid=%d pid=%d size=%zu offset=%ld\n",
+  //        gettid(), path, f_ctx->uid, f_ctx->pid, size, offset);
+
+#ifdef DEBUG
+  f_ctx = fuse_get_context();
+  p_ctx = f_ctx->private_data;
   pthread_mutex_lock(&p_ctx->mutex);
   p_ctx->write++;
   printf("[Thread %d] Write for path %s, userid %d, pid %d\n", gettid(), path,
@@ -470,7 +495,6 @@ static int xmp_write(const char *path, const char *buf, size_t size,
           gettid(), path, f_ctx->uid, f_ctx->pid);
   pthread_mutex_unlock(&p_ctx->mutex);
 #endif
-
   (void)fi;
   if (fi == NULL)
     fd = open(path, O_WRONLY);
@@ -480,26 +504,19 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
-  size_t num_blocks = size / BLOCK_SIZE;
-  char *hash_bytes;
-  char *block;
-  for (int i = 0; i < num_blocks; i++)
-  {
-    memcpy(block, buf + i * BLOCK_SIZE, BLOCK_SIZE);
-    hash(block, hash_bytes);
-  }
-
-  res = pwrite(fd, buf, size, offset);
-  if (res == -1)
-    res = -errno;
+  // write through the dedup layer (handles dedup + overwrite)
+  pthread_mutex_lock(&p_ctx->index->mutex);
+  res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
+                    &p_ctx->nextBlockIndex);
+  pthread_mutex_unlock(&p_ctx->index->mutex);
 
   if (fi == NULL)
     close(fd);
+
   return res;
 }
 
-static int xmp_statfs(const char *path, struct statvfs *stbuf)
-{
+static int xmp_statfs(const char *path, struct statvfs *stbuf) {
   int res;
   res = statvfs(path, stbuf);
   if (res == -1)
@@ -508,8 +525,7 @@ static int xmp_statfs(const char *path, struct statvfs *stbuf)
   return 0;
 }
 
-static int xmp_release(const char *path, struct fuse_file_info *fi)
-{
+static int xmp_release(const char *path, struct fuse_file_info *fi) {
   (void)path;
 
   struct fuse_context *f_ctx = fuse_get_context();
@@ -528,15 +544,13 @@ static int xmp_release(const char *path, struct fuse_file_info *fi)
 }
 
 static int xmp_fsync(const char *path, int isdatasync,
-                     struct fuse_file_info *fi)
-{
+                     struct fuse_file_info *fi) {
 
   (void)path;
 
   // If the datasync parameter is non-zero, then only the user data should be
   // flushed, not the meta data.
-  if (isdatasync == 0)
-  {
+  if (isdatasync == 0) {
     return fsync(fi->fh);
   }
 
@@ -545,8 +559,7 @@ static int xmp_fsync(const char *path, int isdatasync,
 
 #ifdef HAVE_POSIX_FALLOCATE
 static int xmp_fallocate(const char *path, int mode, off_t offset, off_t length,
-                         struct fuse_file_info *fi)
-{
+                         struct fuse_file_info *fi) {
   int fd;
   int res;
 
@@ -574,8 +587,7 @@ static int xmp_fallocate(const char *path, int mode, off_t offset, off_t length,
 #ifdef HAVE_SETXATTR
 /* xattr operations are optional and can safely be left unimplemented */
 static int xmp_setxattr(const char *path, const char *name, const char *value,
-                        size_t size, int flags)
-{
+                        size_t size, int flags) {
   int res = lsetxattr(path, name, value, size, flags);
   if (res == -1)
     return -errno;
@@ -583,24 +595,21 @@ static int xmp_setxattr(const char *path, const char *name, const char *value,
 }
 
 static int xmp_getxattr(const char *path, const char *name, char *value,
-                        size_t size)
-{
+                        size_t size) {
   int res = lgetxattr(path, name, value, size);
   if (res == -1)
     return -errno;
   return res;
 }
 
-static int xmp_listxattr(const char *path, char *list, size_t size)
-{
+static int xmp_listxattr(const char *path, char *list, size_t size) {
   int res = llistxattr(path, list, size);
   if (res == -1)
     return -errno;
   return res;
 }
 
-static int xmp_removexattr(const char *path, const char *name)
-{
+static int xmp_removexattr(const char *path, const char *name) {
   int res = lremovexattr(path, name);
   if (res == -1)
     return -errno;
@@ -613,8 +622,7 @@ static ssize_t xmp_copy_file_range(const char *path_in,
                                    struct fuse_file_info *fi_in,
                                    off_t offset_in, const char *path_out,
                                    struct fuse_file_info *fi_out,
-                                   off_t offset_out, size_t len, int flags)
-{
+                                   off_t offset_out, size_t len, int flags) {
   int fd_in, fd_out;
   ssize_t res;
 
@@ -631,8 +639,7 @@ static ssize_t xmp_copy_file_range(const char *path_in,
   else
     fd_out = fi_out->fh;
 
-  if (fd_out == -1)
-  {
+  if (fd_out == -1) {
     close(fd_in);
     return -errno;
   }
@@ -651,8 +658,7 @@ static ssize_t xmp_copy_file_range(const char *path_in,
 #endif
 
 static off_t xmp_lseek(const char *path, off_t off, int whence,
-                       struct fuse_file_info *fi)
-{
+                       struct fuse_file_info *fi) {
   int fd;
   off_t res;
 
@@ -683,13 +689,13 @@ static const struct fuse_operations xmp_oper = {
     .mknod = xmp_mknod,
     .mkdir = xmp_mkdir,
     .symlink = xmp_symlink,
-    // .unlink = xmp_unlink, // TODO (extra)
+    .unlink = xmp_unlink, // TODO (extra)
     .rmdir = xmp_rmdir,
-    // .rename = xmp_rename, // TODO (extra)
+    .rename = xmp_rename, // TODO (extra)
     .link = xmp_link,
     .chmod = xmp_chmod,
     .chown = xmp_chown,
-// .truncate = xmp_truncate, // TODO (extra)
+    .truncate = xmp_truncate, // TODO (extra)
 #ifdef HAVE_UTIMENSAT
     .utimens = xmp_utimens,
 #endif
@@ -715,25 +721,17 @@ static const struct fuse_operations xmp_oper = {
     // .lseek = xmp_lseek, // TODO (extra)
 };
 
-int main(int argc, char *argv[])
-{
-  enum
-  {
-    MAX_ARGS = 10
-  };
+int main(int argc, char *argv[]) {
+  enum { MAX_ARGS = 10 };
   int i, new_argc;
   char *new_argv[MAX_ARGS];
 
   umask(0);
   /* Process the "--plus" option apart */
-  for (i = 0, new_argc = 0; (i < argc) && (new_argc < MAX_ARGS); i++)
-  {
-    if (!strcmp(argv[i], "--plus"))
-    {
+  for (i = 0, new_argc = 0; (i < argc) && (new_argc < MAX_ARGS); i++) {
+    if (!strcmp(argv[i], "--plus")) {
       fill_dir_plus = FUSE_FILL_DIR_PLUS;
-    }
-    else
-    {
+    } else {
       new_argv[new_argc++] = argv[i];
     }
   }
