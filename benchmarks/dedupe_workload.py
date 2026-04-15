@@ -3,6 +3,9 @@ import random
 import os
 from benchmark_state import State
 
+total_non_dup = 0
+total_dup = 0
+
 def get_config():
     """
     Reads the configuration from config.json and validates it.
@@ -38,6 +41,7 @@ def write(state: State):
     Appends a random number (between the configured range) of blocks, each of them with the
     configured probability of being duplicate.
     """
+    global total_dup, total_non_dup
 
     # first build the whole request in a single buffer
     
@@ -50,13 +54,16 @@ def write(state: State):
 
         if dup:
             state.append_dup_block(i)
+            total_dup += 1
         else:
             state.append_unique_block(i)
+            total_non_dup += 1
 
     # now execute the write operation at once
     file = state.get_random_file()
     if file["fd"] == -1:
         file["fd"] = os.open(file["path"], os.O_RDWR | os.O_APPEND | os.O_CREAT, mode=0o666)
+        file["exists"] = True
     buf = state.get_buffer(num_blocks * 4096)
     bytes_written = os.write(file["fd"], buf)
     if bytes_written != num_bytes:
@@ -88,7 +95,9 @@ def read(state: State):
     size = num_blocks * 4096
     buf = state.get_buffer(size)
 
-    _ = os.pread(fd, size, offset)
+    result = os.pread(fd, size, offset)
+    if len(result) != size:
+        print("A read request returned a result with an incorrect length!!!")
 
 
 def unlink(state: State):
@@ -141,6 +150,10 @@ def main():
     state = State(config)
     workload(state)
     state.free()
+
+    print("Benchmark done!")
+    print(f"Number of duplicate blocks written: {total_dup}")
+    print(f"Number of non-duplicate blocks written: {total_non_dup}")
 
 
 if __name__ == '__main__':
