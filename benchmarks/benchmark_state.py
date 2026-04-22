@@ -16,11 +16,17 @@ class State():
         self.num_ops: int = config["num_ops"]
         self.num_files: int = config["num_files"]
         self.num_unique_dup_blocks: int = config["num_unique_dup_blocks"]
+        self.test_file_path_format: str = config["test_file_path_format"]
 
         # file tracking
 
         self.files = [
-            {"fd": -1, "path": f"test_file{i}", "size": 0, "exists": False}
+            {
+                "fd": -1,
+                "path": self.test_file_path_format.format(index=i),
+                "size": 0,
+                "exists": False,
+            }
             for i in range(self.num_files)
         ]
 
@@ -102,4 +108,3 @@ class State():
         for file in self.files:
             if file["fd"] != -1:
                 os.close(file["fd"])
-

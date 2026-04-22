@@ -32,6 +32,15 @@ def get_config():
     if config["num_unique_dup_blocks"] <= 0:
         print("Number of unique duplicate blocks must be greater than 0")
         return None
+    test_file_path_format = config.get("test_file_path_format")
+    if not isinstance(test_file_path_format, str) or test_file_path_format == "":
+        print("Invalid test file path format")
+        return None
+    try:
+        _ = test_file_path_format.format(index=0)
+    except (KeyError, IndexError, ValueError):
+        print("Invalid test file path format, expected a Python format string using {index}")
+        return None
     return config
 
 
