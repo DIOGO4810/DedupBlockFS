@@ -120,7 +120,7 @@ int get_unique_op_values(CounterKey *keys, int num_entries, int *op_list) {
  * the number of entries in the arrays (int num_entries), an array of strings with the unique pid values
  * (char (*pid_list)[COMM_STR_LEN]), the number of unique pid values (int pid_count), an array of integers with the unique
  * op values (int *op_list) and the number of unique op values (int op_count) as arguments.
- * Prints the results in a table format with the pids as rows and the ops as columns, and the total for each op at the end
+ * Prints the results in a table format with the pids as rows and the ops as columns, and an aggregate row per op at the end
  */
 void print_results(CounterKey *keys, CounterValue *values, int num_entries, char (*pid_list)[COMM_STR_LEN], int pid_count,
 				   int *op_list, int op_count) {
@@ -150,9 +150,9 @@ void print_results(CounterKey *keys, CounterValue *values, int num_entries, char
 					total_op_list[i].time_sum += val.time_sum;
 				}
 			}
-			long time = val.time_sum / 1e6;  // milliseconds
+			long avg_time_ns = val.count ? (val.time_sum / val.count) : 0;
 			char cell[20];
-			snprintf(cell, sizeof(cell), "%06ldx | %ldms", val.count, time);
+			snprintf(cell, sizeof(cell), "%06ldx | %ldns", val.count, avg_time_ns);
 			printf("%-20s", cell);
 		}
 		printf("\n");
@@ -164,9 +164,9 @@ void print_results(CounterKey *keys, CounterValue *values, int num_entries, char
 
 	printf("%-32s", "Total");
 	for (int i = 0; i < op_count; i++) {
-		long time = total_op_list[i].time_sum / 1e6;  // milliseconds
+		long avg_time_ns = total_op_list[i].count ? (total_op_list[i].time_sum / total_op_list[i].count) : 0;
 		char cell[20];
-		snprintf(cell, sizeof(cell), "%06ldx | %ldms", total_op_list[i].count, time);
+		snprintf(cell, sizeof(cell), "%06ldx | %ldns", total_op_list[i].count, avg_time_ns);
 		printf("%-20s", cell);
 	}
 	printf("\n");
