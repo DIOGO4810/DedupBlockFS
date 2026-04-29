@@ -163,8 +163,11 @@ Index *index_init(void) {
       ghash_load(TABLE_PATH_FILE_TO_SIZES, g_str_hash, g_str_equal, decode_str,
                  decode_size, g_free, g_free);
 
-  index->free_block_list =
-      gslist_load(TABLE_PATH_FREE_BLOCK_LIST, decode_free_block);
+  // Carrega a free list. Nesta fase do refactor (Commit 2), freelist_load é
+  // ainda um stub e a free list arranca sempre vazia. A persistência real
+  // virá no Commit 4 (com auto-coalesce do formato antigo). Entre estes
+  // commits, é necessário correr clean_fuse_data.sh entre arranques.
+  freelist_load(TABLE_PATH_FREE_BLOCK_LIST, &index->free_list);
 
   pthread_mutex_init(&index->mutex, NULL);
 
@@ -185,8 +188,9 @@ void index_destroy(Index *index) {
                           encode_master_info);
   ghash_save(TABLE_PATH_FILE_TO_SIZES, index->file_to_sizes, encode_str,
              encode_size, FALSE, FALSE);
-  gslist_save(TABLE_PATH_FREE_BLOCK_LIST, index->free_block_list,
-              encode_free_block);
+  // Persistência da free list. Stub no Commit 2; implementação real no
+  // Commit 4.
+  freelist_save(TABLE_PATH_FREE_BLOCK_LIST, &index->free_list);
 
   pthread_mutex_unlock(&index->mutex);
 
@@ -203,7 +207,7 @@ void index_destroy(Index *index) {
   g_hash_table_destroy(index->file_to_master);
   g_hash_table_destroy(index->hash_to_master);
   g_hash_table_destroy(index->file_to_sizes);
-  g_slist_free_full(index->free_block_list, free);
+  freelist_destroy(&index->free_list);
 
   pthread_mutex_destroy(&index->mutex);
   free(index);
