@@ -204,10 +204,12 @@ storage-first produz `master_blk` dispersos, e o flush acaba por emitir
 mais que um syscall. **Aceitamos este custo** em troca de não desperdiçar
 espaço.
 
-A alternativa — política `syscall-first` com fallback para append quando
-extents são pequenos demais — **fica disponível como opção configurável**
-através da variável de ambiente `DEDUP_ALLOC_POLICY` (ver §7 deste
-documento), permitindo comparações empíricas.
+Uma alternativa — política `syscall-first` com fallback para append quando
+extents são pequenos demais — foi prototipada e descartada após medições
+empíricas: nos workloads testados, as duas políticas convergem no caminho
+quente (free list vazia ou com 1 extent grande coalescido) e o syscall
+count fica indistinguível. A configurabilidade entre políticas pode voltar
+a ser explorada se um workload futuro mostrar divergência mensurável.
 
 ### 5.3 Por que NÃO `io_uring`
 
@@ -231,9 +233,8 @@ documento), permitindo comparações empíricas.
 ### Já feito neste PR
 - Refactor de `write_dedup` em dois passes com `pwritev`.
 - Mapa de extents (`FreeList`) com coalescing on release.
-- Allocator storage-first como default.
+- Allocator storage-first como única política activa.
 - Persistência migrável (auto-coalesce do formato antigo).
-- Configurabilidade `storage-first` ↔ `syscall-first` via env var.
 - Teste de round-trip (`tests/roundtrip.sh`).
 
 ### Trabalho futuro (intencionalmente adiado)
@@ -249,53 +250,14 @@ documento), permitindo comparações empíricas.
 - **Encolher `nextBlockIndex` no release** quando o slot libertado toca
   a fronteira do master. Micro-optimização; deixada como TODO.
 
-- **Mount option FUSE `-o alloc_policy=...`** em vez de variável de
-  ambiente. Mais idiomático em FUSE, mas requer parsing extra em `main()`.
-
-- **`max_fragments` em storage-first** como salvaguarda contra fragmentação
-  patológica (cap no nº de runs por batch, depois fallback a append). Reservado
-  no `AllocConfig` mas não implementado — activar apenas se medições
-  mostrarem cenários patológicos persistentes.
+- **Reintroduzir política syscall-first configurável** se um workload
+  futuro mostrar divergência mensurável face à storage-first. O ponto de
+  variação está concentrado em `allocate_batch_storage_first` —
+  facilmente substituível por um switch.
 
 ---
 
-## 7. Configuração da política de alocação
-
-A política é seleccionável via variáveis de ambiente, lidas em `xmp_init`.
-
-| Variável | Valores | Default | Aplicabilidade |
-|---|---|---|---|
-| `DEDUP_ALLOC_POLICY` | `storage_first`, `syscall_first` | `storage_first` | sempre |
-| `DEDUP_THRESHOLD` | inteiro `≥ 0` | `4` | só `syscall_first` |
-| `DEDUP_MAX_FRAGMENTS` | inteiro `≥ 0` | `0` (ilimitado) | reservado, sem efeito |
-
-### Exemplos
-
-```bash
-# Storage-first (default): master nunca cresce com slots livres.
-sudo ./fuse.sh
-
-# Syscall-first com threshold 8: ignora extents < 8 blocos, faz append.
-DEDUP_ALLOC_POLICY=syscall_first DEDUP_THRESHOLD=8 sudo -E ./fuse.sh
-```
-
-A política escolhida é registada em log no arranque do FS:
-```
-[alloc-policy] policy=storage_first threshold=4 max_fragments=0
-```
-
-### Comparação esperada das métricas
-
-| Métrica | `storage_first` | `syscall_first` |
-|---|---|---|
-| Tamanho final do master | menor | maior sob fragmentação |
-| Syscalls `pwrite/pwritev` por request | 1 quando contíguo, mais sob fragmentação | 1 ou 2 mesmo sob fragmentação |
-| Comportamento em workloads write-puro | igual (free list vazia) | igual |
-| Comportamento em workloads write+unlink | reuso máximo | reuso parcial |
-
----
-
-## 8. Verificação
+## 7. Verificação
 
 ### Build e benchmark
 
@@ -327,7 +289,7 @@ sudo umount /mnt/fs
 
 ---
 
-## 9. Glossário
+## 8. Glossário
 
 - **Bloco** — unidade de 4 KiB, alinhada.
 - **Bloco lógico** — bloco indexado por `(path, offset)`, do ponto de vista
@@ -343,5 +305,6 @@ sudo umount /mnt/fs
   agrupada num único `pwritev` durante o flush.
 - **Batch** — conjunto de blocos lógicos de um único request FUSE.
 - **Coalesce** — fundir extents adjacentes num só.
-- **Storage-first** — política que prioriza não crescer o master.
-- **Syscall-first** — política que prioriza minimizar syscalls.
+- **Storage-first** — política de alocação que prioriza não crescer o
+  master, drenando sempre a free list antes de fazer append. É a
+  política activa na biblioteca.
