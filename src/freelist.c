@@ -399,9 +399,9 @@ static void *decode_raw(void *data, int size) {
 void freelist_load(const char *path, FreeList *fl) {
   freelist_init(fl);
 
-  int fd = open(path, O_RDONLY | O_CREAT, 0644);
+  int fd = open(path, O_RDONLY);
   if (fd < 0)
-    return;
+    return;  // ficheiro ainda não existe: freelist começa vazia
 
   // Header: número de entradas.
   int n = 0;

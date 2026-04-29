@@ -230,11 +230,13 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
 //   - Os HITs que tiveram refcount++ no Passe 1 são revertidos. Se um HIT
 //     for para um MasterInfo PENDENTE deste mesmo batch (intra-batch dedup),
 //     a libertação fica a cargo do MISS original.
-//   - `*next_block_index` é restaurado ao valor pré-batch, o que é seguro
-//     porque o mutex grosseiro impede que outra escrita o tenha tocado.
-static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
-                                  uint64_t *next_block_index,
-                                  uint64_t saved_next) {
+//
+// Nota sobre nextBlockIndex: NÃO restauramos nextBlockIndex porque os blocos
+// alocados por append já foram adicionados à free list via freelist_release.
+// Restaurar nextBlockIndex criaria uma dupla alocação: o mesmo índice ficaria
+// tanto na free list como no ponto de append, podendo ser atribuído duas vezes
+// na próxima escrita.
+static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // Reverter HITs: decrementa refcount; se for um MasterInfo já no índice
   // oficial e o refcount cair a 0, restaurá-lo seria muito invasivo, e não
   // acontece neste cenário de erro local (o MasterInfo só estava no índice
@@ -250,15 +252,14 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
   // Reverter MISSes: devolver master_blk à free list, libertar MasterInfo
   // pendente. A free list aceita slots em qualquer ordem; o coalescing
   // funde-os automaticamente se forem adjacentes.
+  // Tanto slots retirados da free list como slots alocados por append são
+  // devolvidos aqui — serão reutilizados nas próximas escritas.
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
       freelist_release(&idx->free_list, plan[i].master_blk);
       free(plan[i].info);
     }
   }
-
-  // Restaurar nextBlockIndex. Seguro sob mutex grosseiro.
-  *next_block_index = saved_next;
 }
 
 // -----------------------------------------------------------------------------
@@ -276,7 +277,6 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     return 0;
 
   uint64_t start_block = offset / BLOCK_SIZE;
-  uint64_t saved_next = *nextBlockIndex;
 
   // Plan vive na stack quando num_blocks é razoável. Para requests muito
   // grandes (muito raros — FUSE max_write costuma ser <= 1 MiB = 256 blocos),
@@ -371,10 +371,9 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   if (miss_count > 0) {
     int rc = flush_plan(masterFd, plan, num_blocks);
     if (rc < 0) {
-      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes,
-      // refcounts dos HITs e nextBlockIndex são restaurados.
-      rollback_allocations(index, plan, num_blocks, nextBlockIndex,
-                           saved_next);
+      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes e
+      // refcounts dos HITs são revertidos.
+      rollback_allocations(index, plan, num_blocks);
       g_hash_table_destroy(pending_hashes);
       if (plan_heap)
         g_free(plan_heap);
