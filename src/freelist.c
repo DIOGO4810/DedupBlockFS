@@ -30,10 +30,13 @@
 // =============================================================================
 
 #include "freelist.h"
+#include "persistence.h"
+#include <fcntl.h>
 #include <glib.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 // -----------------------------------------------------------------------------
 // Helpers de chave/destruição para o GTree
@@ -313,20 +316,138 @@ void freelist_release_run(FreeList *fl, uint64_t start, uint64_t length) {
 }
 
 // -----------------------------------------------------------------------------
-// Persistência (stubs — implementação real no Commit 4)
+// Persistência
 // -----------------------------------------------------------------------------
+//
+// Formato em disco:
+//   - Header: `int32 n_entries`.
+//   - Por entrada: `[size_t marker][...payload...]`.
+//
+// O `marker` é o tamanho em bytes do payload, escrito pelo `write_elem` de
+// persistence.c. Distinguimos dois formatos legíveis:
+//
+//   marker == 8  → formato ANTIGO. Payload é um único `uint64_t` representando
+//                  um slot solto. Cada entrada vira uma chamada a
+//                  freelist_release no mapa novo, accionando coalescing
+//                  automático e produzindo extents canónicos.
+//
+//   marker == 16 → formato NOVO. Payload é `(uint64 start, uint64 length)`,
+//                  um Extent já no formato canónico. Inserido directamente
+//                  sem coalescing (já é canónico por construção do save).
+//
+// Esta detecção permite migrar persistência antiga sem perder estado.
+
+#define EXTENT_PAYLOAD_SIZE 16   // 8 (start) + 8 (length)
+#define LEGACY_PAYLOAD_SIZE 8    // formato antigo: só um uint64_t por entrada
+
+// Layout em disco do payload de cada extent (16 bytes contíguos).
+typedef struct {
+  uint64_t start;
+  uint64_t length;
+} extent_wire_t;
+
+// Contexto passado ao callback de g_tree_foreach durante o save.
+typedef struct {
+  int fd;
+  off_t offset;
+} save_ctx_t;
+
+static gboolean save_extent_cb(gpointer key, gpointer value, gpointer data) {
+  (void)key;
+  Extent *e = (Extent *)value;
+  save_ctx_t *ctx = (save_ctx_t *)data;
+
+  // write_elem escreve [size_t][payload]. Passamos um Bytes com o payload
+  // de 16 bytes representando (start, length).
+  extent_wire_t wire = { .start = e->start, .length = e->length };
+  Bytes b = { .data = &wire, .size = EXTENT_PAYLOAD_SIZE };
+  write_elem(ctx->fd, b, &ctx->offset);
+
+  return FALSE;  // FALSE = continuar a iterar
+}
 
 void freelist_save(const char *path, FreeList *fl) {
-  (void)path;
-  (void)fl;
-  // TODO: implementação real no Commit 4 (formato (start, length) com
-  // auto-coalesce do formato antigo durante a transição).
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    return;
+
+  // Cabeçalho: número de extents (não de slots).
+  int n = g_tree_nnodes(fl->by_start);
+  off_t offset = 0;
+  if (pwrite(fd, &n, sizeof(n), offset) != sizeof(n)) {
+    close(fd);
+    return;
+  }
+  offset += sizeof(n);
+
+  save_ctx_t ctx = { .fd = fd, .offset = offset };
+  g_tree_foreach(fl->by_start, save_extent_cb, &ctx);
+
+  close(fd);
+}
+
+// Decoder genérico: simplesmente devolve uma cópia heap-alocada do payload
+// recebido. O caller (freelist_load) é que interpreta o conteúdo conforme
+// o tamanho.
+static void *decode_raw(void *data, int size) {
+  void *copy = malloc(size);
+  if (copy)
+    memcpy(copy, data, size);
+  return copy;
 }
 
 void freelist_load(const char *path, FreeList *fl) {
-  (void)path;
-  // TODO: implementação real no Commit 4.
-  // Por agora, partimos sempre de uma free list vazia — o utilizador
-  // tem de correr clean_fuse_data.sh entre arranques durante os Commits 2-3.
   freelist_init(fl);
+
+  int fd = open(path, O_RDONLY | O_CREAT, 0644);
+  if (fd < 0)
+    return;
+
+  // Header: número de entradas.
+  int n = 0;
+  off_t offset = 0;
+  ssize_t n_read = pread(fd, &n, sizeof(n), offset);
+  if (n_read != sizeof(n)) {
+    close(fd);
+    return;
+  }
+  offset += sizeof(n);
+
+  // Lê cada entrada. O `read_elem` consome size + payload e devolve o
+  // payload pelo decode_func; nós usamos decode_raw e inspeccionamos o
+  // tamanho lendo-o directamente do disco (peek antes do read_elem).
+  for (int i = 0; i < n; i++) {
+    // Peek ao tamanho da próxima entrada (sem avançar o offset principal).
+    size_t marker = 0;
+    if (pread(fd, &marker, sizeof(marker), offset) != sizeof(marker))
+      break;
+
+    if (marker == EXTENT_PAYLOAD_SIZE) {
+      // Formato novo. Lê o payload completo via read_elem (que respeita o
+      // protocolo size+payload) e interpreta como (start, length).
+      void *raw = read_elem(fd, decode_raw, &offset);
+      if (!raw) break;
+      extent_wire_t *wire = (extent_wire_t *)raw;
+      Extent *e = g_new(Extent, 1);
+      e->start = wire->start;
+      e->length = wire->length;
+      tree_insert(fl->by_start, e);
+      free(raw);
+    } else if (marker == LEGACY_PAYLOAD_SIZE) {
+      // Formato antigo: cada entrada é um slot isolado. Lê o uint64_t e
+      // chama freelist_release, que automaticamente faz coalescing com
+      // os vizinhos já carregados.
+      void *raw = read_elem(fd, decode_raw, &offset);
+      if (!raw) break;
+      uint64_t slot = *(uint64_t *)raw;
+      free(raw);
+      freelist_release(fl, slot);
+    } else {
+      // Formato desconhecido. Aborta o load (ficheiro corrompido?).
+      // Não tentamos saltar a entrada para evitar acumular lixo.
+      break;
+    }
+  }
+
+  close(fd);
 }

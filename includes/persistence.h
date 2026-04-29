@@ -59,4 +59,10 @@ IndexedPairTables ghash_load_indexed_pair(
 void gslist_save(const char *path, GSList *list, EncodeFunc encode_elem);
 GSList *gslist_load(const char *path, DecodeFunc decode_elem);
 
+// Helpers de baixo-nível para escrever/ler elementos prefixados por tamanho
+// (size_t prefix + payload). Expostos para que módulos como `freelist`
+// possam reaproveitar o mesmo formato sem duplicar código.
+void write_elem(int fd, Bytes b, off_t *offset);
+void *read_elem(int fd, DecodeFunc decode_func, off_t *offset);
+
 #endif
