@@ -1,0 +1,97 @@
+import sys
+import re
+from csv import DictReader, writer
+from statistics import mean, stdev
+
+argc = len(sys.argv)
+command_regex: str = ""
+input_csvs: list[str] = []
+output_csv: str = ""
+aggregator_time: dict[str, dict[str, list[int]|int]] = {}
+aggregator_count: dict[str, dict[str, list[int]|int]] = {}
+
+
+def parse_args() -> bool:
+    global argc, command_regex, input_csvs, output_csv
+
+    if argc < 3:
+        print("Usage: python3 process_csv.py <command_regex> <list_input_CSVs> <output_CSV>")
+        return False
+
+    command_regex = sys.argv[1]
+    for i in range(2,argc-1):
+        input_csvs.append(sys.argv[i])
+    output_csv = sys.argv[argc-1]
+    
+    return True
+
+
+def process_file(file: str):
+    with open(file, mode='r') as f:
+        csv_reader = DictReader(f)
+        for row in csv_reader:
+            if row["PID-Command"] == "TOTAL":
+                continue
+            if re.search(command_regex, row["PID-Command"]):
+                syscall = row["Syscall Name"]
+                time = int(row["Avg Time (ns)"])
+                count = int(row["Count"])
+                old_time = aggregator_time.get(syscall)
+                old_count = aggregator_count.get(syscall)
+                if old_time is None:
+                    aggregator_time[syscall] = {
+                        "times": [time],
+                        "n": 1
+                    }
+                else:
+                    old_time["times"].append(time)
+                    old_time["n"] += 1
+                if old_count is None:
+                    aggregator_count[syscall] = {
+                        "counts": [count],
+                        "n": 1
+                    }
+                else:
+                    old_count["counts"].append(count)
+                    old_count["n"] += 1
+
+
+def prepare_output() -> tuple[list[str],list[str]]:
+    fields = []
+    data = []
+
+    for syscall in aggregator_time:
+        fields.append(f"{syscall}_avg_time")
+        time_and_n = aggregator_time[syscall]
+        times = time_and_n["times"]
+        average = mean(times)
+        data.append(average)
+        st_dev = stdev(times) if len(times) > 1 else 0.0
+        fields.append(f"{syscall}_stdev_time")
+        data.append(st_dev)
+    
+    for syscall in aggregator_count:
+        fields.append(f"{syscall}_avg_count")
+        count_and_n = aggregator_count[syscall]
+        counts = count_and_n["counts"]
+        average = mean(counts)
+        data.append(average)
+        st_dev = stdev(counts) if len(counts) > 1 else 0.0
+        fields.append(f"{syscall}_stdev_count")
+        data.append(st_dev)
+
+    return (fields, data)
+
+
+if not parse_args():
+    exit()
+
+for file in input_csvs:
+    process_file(file)
+
+fields, data = prepare_output()
+with open(output_csv, "w", newline="") as out:
+    csv_writer = writer(out)
+    csv_writer.writerow(fields)
+    csv_writer.writerow(data)
+
