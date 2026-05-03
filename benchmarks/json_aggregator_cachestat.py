@@ -1,5 +1,4 @@
 import sys
-import re
 import json
 from statistics import mean, stdev
 
@@ -24,7 +23,6 @@ def parse_args() -> bool:
 
 
 def process_file(file: str):
-    global aggregator
     with open(file, mode='r') as f:
         data = json.load(f)
         for field in data:
@@ -37,13 +35,12 @@ def process_file(file: str):
 
 
 def prepare_output() -> dict[str, int]:
-    global aggregator
     output_dict = {}
 
     for field in aggregator:
         acc_values = aggregator[field]
         avg = mean(acc_values)
-        st_dev = stdev(acc_values)
+        st_dev = stdev(acc_values) if len(acc_values) > 1 else 0.0
         output_dict[f"{field}_avg"] = avg
         output_dict[f"{field}_stdev"] = st_dev
 
