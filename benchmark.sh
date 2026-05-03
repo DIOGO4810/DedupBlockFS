@@ -109,6 +109,7 @@ PASSTHROUGH_PID=""
 WORKLOAD_PID=""
 SYSCOUNTER_PASSTHROUGH_PID=""
 SYSCOUNTER_WORKLOAD_PID=""
+CACHESTAT_PASSTHROUGH_PID=""
 
 cleanup() {
   set +e
@@ -118,6 +119,9 @@ cleanup() {
   fi
   if [[ -n "${SYSCOUNTER_PASSTHROUGH_PID}" ]]; then
     sudo kill -INT "$SYSCOUNTER_PASSTHROUGH_PID" 2>/dev/null || true
+  fi
+  if [[ -n "${CACHESTAT_PASSTHROUGH_PID}" ]]; then
+    sudo kill -INT "$CACHESTAT_PASSTHROUGH_PID" 2>/dev/null || true
   fi
 
   if [[ -n "${WORKLOAD_PID}" ]]; then
@@ -167,6 +171,11 @@ WORKLOAD_CSV="$OUTDIR/workload_results.csv"
 SYSCOUNTER_PASSTHROUGH_PID="$(sudo_detached_pid "./bpf_programs/syscounter/syscounter $PASSTHROUGH_PID '$PASSTHROUGH_CSV'" "$ROOT" "$OUTDIR/syscounter_passthrough.log")"
 SYSCOUNTER_WORKLOAD_PID="$(sudo_detached_pid "./bpf_programs/syscounter/syscounter $WORKLOAD_PID '$WORKLOAD_CSV'" "$ROOT" "$OUTDIR/syscounter_workload.log")"
 
+log "Starting cachestat for passthrough"
+CACHESTAT_PASSTHROUGH_JSON="$OUTDIR/cachestat_passthrough.json"
+CACHESTAT_PASSTHROUGH_PID="$(sudo_detached_pid "./cachestat 99999 --pids $PASSTHROUGH_PID --output '$CACHESTAT_PASSTHROUGH_JSON'" "$ROOT/bpf_programs/cachestat" "$OUTDIR/cachestat_passthrough.log")"
+[[ "$CACHESTAT_PASSTHROUGH_PID" =~ ^[0-9]+$ ]] || die "Failed to start cachestat for passthrough (got PID: $CACHESTAT_PASSTHROUGH_PID)"
+
 sleep 1
 
 log "Resuming workload"
@@ -184,18 +193,22 @@ printf 'workload_rc=%s\nelapsed_ms=%s\n' "$workload_rc" "$elapsed_ms" >"$OUTDIR/
 
 log "Workload finished (rc=$workload_rc, elapsed_ms=$elapsed_ms)"
 
-log "Stopping syscounter (SIGINT)"
+log "Stopping BPF programs (SIGINT)"
 sudo kill -INT "$SYSCOUNTER_PASSTHROUGH_PID" 2>/dev/null || true
 sudo kill -INT "$SYSCOUNTER_WORKLOAD_PID" 2>/dev/null || true
+sudo kill -INT "$CACHESTAT_PASSTHROUGH_PID" 2>/dev/null || true
 
 wait_for_exit_root "$SYSCOUNTER_PASSTHROUGH_PID" 10 || log "syscounter(passthrough) did not exit within timeout"
 wait_for_exit_root "$SYSCOUNTER_WORKLOAD_PID" 10 || log "syscounter(workload) did not exit within timeout"
+wait_for_exit_root "$CACHESTAT_PASSTHROUGH_PID" 10 || log "cachestat(passthrough) did not exit within timeout"
 
 # Make sure artifacts are readable without sudo.
 chown_if_exists_root "$PASSTHROUGH_CSV"
 chown_if_exists_root "$WORKLOAD_CSV"
 chown_if_exists_root "$OUTDIR/syscounter_passthrough.log"
 chown_if_exists_root "$OUTDIR/syscounter_workload.log"
+chown_if_exists_root "$OUTDIR/cachestat_passthrough.log"
+chown_if_exists_root "$CACHESTAT_PASSTHROUGH_JSON"
 chown_if_exists_root "$PASSTHROUGH_LOG"
 
 unmount_fs_if_mounted
@@ -242,6 +255,7 @@ PASSTHROUGH_PID=$PASSTHROUGH_PID
 WORKLOAD_PID=$WORKLOAD_PID
 SYSCOUNTER_PASSTHROUGH_PID=$SYSCOUNTER_PASSTHROUGH_PID
 SYSCOUNTER_WORKLOAD_PID=$SYSCOUNTER_WORKLOAD_PID
+CACHESTAT_PASSTHROUGH_PID=$CACHESTAT_PASSTHROUGH_PID
 EOF
 
 log "Done. Results in: $OUTDIR"
