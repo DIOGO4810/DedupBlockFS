@@ -209,10 +209,34 @@ fi
 log "Measuring disk used"
 {
   echo "# masterFILE"
-  sudo du -h /masterFILE 2>&1 || true
+  sudo du -m /masterFILE 2>&1 || true
   echo
-  echo "# backend"
-  sudo du -h /backend 2>&1 || true
+
+  metaindex_paths=(
+    /table_path_hash_to_master
+    /table_path_file_to_master
+    /table_path_master_infos
+    /table_path_file_to_sizes
+    /table_path_free_block_list
+  )
+
+  total_metaindex_mb=0
+  for path in "${metaindex_paths[@]}"; do
+    echo "# $path"
+    if du_output="$(sudo du -m "$path" 2>&1)"; then
+      echo "$du_output"
+      used_mb="$(awk '{print $1}' <<<"$du_output")"
+      if [[ "$used_mb" =~ ^[0-9]+$ ]]; then
+        total_metaindex_mb=$((total_metaindex_mb + used_mb))
+      fi
+    else
+      echo "$du_output"
+    fi
+    echo
+  done
+
+  echo "# total_metaindex_files_mb"
+  echo "${total_metaindex_mb} MB"
 } | tee "$OUTDIR/disk_usage.txt" >/dev/null
 chown_if_exists_root "$OUTDIR/disk_usage.txt"
 
