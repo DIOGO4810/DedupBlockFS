@@ -70,6 +70,13 @@ wait_for_exit_root() {
   return 1
 }
 
+unmount_fs_if_mounted() {
+  if mountpoint -q /mnt/fs; then
+    log "Unmounting /mnt/fs"
+    sudo umount /mnt/fs 2>/dev/null || true
+  fi
+}
+
 chown_if_exists_root() {
   local path="$1"
   [[ -e "$path" ]] || return 0
@@ -117,9 +124,7 @@ cleanup() {
     kill -CONT "$WORKLOAD_PID" 2>/dev/null || true
   fi
 
-  if [[ -n "${PASSTHROUGH_PID}" ]]; then
-    sudo kill -INT "$PASSTHROUGH_PID" 2>/dev/null || true
-  fi
+  unmount_fs_if_mounted
 }
 trap cleanup EXIT
 
@@ -193,17 +198,9 @@ chown_if_exists_root "$OUTDIR/syscounter_passthrough.log"
 chown_if_exists_root "$OUTDIR/syscounter_workload.log"
 chown_if_exists_root "$PASSTHROUGH_LOG"
 
-log "Stopping passthrough (SIGINT)"
-sudo kill -INT "$PASSTHROUGH_PID" 2>/dev/null || true
-wait_for_exit_root "$PASSTHROUGH_PID" 10 || log "passthrough did not exit within timeout"
-
-# Best-effort unmount if still mounted.
-if mountpoint -q /mnt/fs; then
-  log "Unmounting /mnt/fs"
-  if command -v fusermount3 >/dev/null 2>&1; then
-    sudo fusermount3 -u /mnt/fs 2>/dev/null || true
-  fi
-  sudo umount /mnt/fs 2>/dev/null || true
+unmount_fs_if_mounted
+if [[ -n "${PASSTHROUGH_PID}" ]]; then
+  wait_for_exit_root "$PASSTHROUGH_PID" 10 || log "passthrough did not exit within timeout"
 fi
 
 log "Measuring disk used"
