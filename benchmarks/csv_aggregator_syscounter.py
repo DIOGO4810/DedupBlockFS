@@ -7,8 +7,8 @@ argc = len(sys.argv)
 command_regex: str = ""
 input_csvs: list[str] = []
 output_csv: str = ""
-aggregator_time: dict[str, dict[str, list[int]|int]] = {}
-aggregator_count: dict[str, dict[str, list[int]|int]] = {}
+aggregator_time: dict[str, list[int]] = {}
+aggregator_count: dict[str, list[int]] = {}
 
 
 def parse_args() -> bool:
@@ -39,21 +39,13 @@ def process_file(file: str):
                 old_time = aggregator_time.get(syscall)
                 old_count = aggregator_count.get(syscall)
                 if old_time is None:
-                    aggregator_time[syscall] = {
-                        "times": [time],
-                        "n": 1
-                    }
+                    aggregator_time[syscall] = [time]
                 else:
-                    old_time["times"].append(time)
-                    old_time["n"] += 1
+                    old_time.append(time)
                 if old_count is None:
-                    aggregator_count[syscall] = {
-                        "counts": [count],
-                        "n": 1
-                    }
+                    aggregator_count[syscall] = [count]
                 else:
-                    old_count["counts"].append(count)
-                    old_count["n"] += 1
+                    old_count.append(count)
 
 
 def prepare_output() -> tuple[list[str],list[str]]:
@@ -62,8 +54,7 @@ def prepare_output() -> tuple[list[str],list[str]]:
 
     for syscall in aggregator_time:
         fields.append(f"{syscall}_avg_time")
-        time_and_n = aggregator_time[syscall]
-        times = time_and_n["times"]
+        times = aggregator_time[syscall]
         average = mean(times)
         data.append(average)
         st_dev = stdev(times) if len(times) > 1 else 0.0
@@ -72,8 +63,7 @@ def prepare_output() -> tuple[list[str],list[str]]:
     
     for syscall in aggregator_count:
         fields.append(f"{syscall}_avg_count")
-        count_and_n = aggregator_count[syscall]
-        counts = count_and_n["counts"]
+        counts = aggregator_count[syscall]
         average = mean(counts)
         data.append(average)
         st_dev = stdev(counts) if len(counts) > 1 else 0.0
@@ -94,4 +84,3 @@ with open(output_csv, "w", newline="") as out:
     csv_writer = writer(out)
     csv_writer.writerow(fields)
     csv_writer.writerow(data)
-
