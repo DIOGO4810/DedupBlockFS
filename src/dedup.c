@@ -38,7 +38,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/uio.h>   // pwritev / struct iovec
 #include <unistd.h>
 #ifdef __FreeBSD__
 #include <sys/socket.h>
@@ -172,9 +171,14 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
 // master_blk são também consecutivos. Quando isso acontece, podemos emitir
 // um único pwritev em vez de N pwrite — N syscalls a 1.
 //
-// Runs de tamanho 1 degeneram para pwrite (igualmente eficiente).
+// Runs de tamanho 1 degeneram para 1 pwrite de 4 KiB.
 // HITs no meio do plan não impedem runs longos: simplesmente saltam-se,
 // porque os HITs não geram I/O.
+//
+// Sem pwritev: dentro de um run os payloads são FISICAMENTE contíguos
+// no buffer de input do utilizador (a ordem do plan é a ordem dos blocos
+// lógicos no buf). Logo o run inteiro pode ser escrito com um único
+// pwrite que parte de plan[run_start].payload e cobre run_len * BLOCK_SIZE.
 //
 // Retorna 0 em sucesso, -errno em falha. O caller é responsável pelo
 // rollback em caso de falha.
@@ -188,7 +192,10 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
     if (i == n) break;
 
     // Construir um run a partir do MISS actual, juntando MISSes seguintes
-    // cujo master_blk seja exactamente o anterior + 1.
+    // cujo master_blk seja exactamente o anterior + 1. Como o plan é
+    // percorrido pela ordem dos blocos lógicos, MISSes consecutivos no
+    // plan estão também em posições consecutivas no buffer de input —
+    // ou seja, o run é contíguo em memória e no master.
     size_t run_start = i;
     size_t run_len = 1;
     i++;
@@ -198,20 +205,13 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
       i++;
     }
 
-    // Construir o vector de iovecs (pode não ser preciso, mas mantém o
-    // código simétrico entre run=1 e run>1).
-    struct iovec iov[run_len];
-    for (size_t j = 0; j < run_len; j++) {
-      // pwritev/pwrite escrevem para offsets do ficheiro, não modificam
-      // o buffer de origem. O cast para void* é seguro.
-      iov[j].iov_base = (void *)plan[run_start + j].payload;
-      iov[j].iov_len = BLOCK_SIZE;
-    }
-
     off_t offset = (off_t)plan[run_start].master_blk * BLOCK_SIZE;
-    ssize_t written = pwritev(masterFd, iov, (int)run_len, offset);
+    size_t bytes = run_len * BLOCK_SIZE;
+    // Um único pwrite cobre o run inteiro. Para run_len==1 fica a
+    // semântica clássica de pwrite de um bloco isolado.
+    ssize_t written = pwrite(masterFd, plan[run_start].payload, bytes, offset);
 
-    if (written != (ssize_t)(run_len * BLOCK_SIZE)) {
+    if (written != (ssize_t)bytes) {
       // Falha total ou parcial: para simplificar, tratamos qualquer caso
       // como erro. O caller faz rollback.
       return (written < 0) ? -errno : -EIO;
