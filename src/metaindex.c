@@ -75,6 +75,15 @@ void *decode_block_indice(void *data, int size) {
   return b;
 }
 
+Bytes encode_free_block(void *elem) { return (Bytes){elem, sizeof(size_t)}; }
+
+void *decode_free_block(void *data, int size) {
+  (void)size;
+  size_t *value = malloc(sizeof(size_t));
+  memcpy(value, data, sizeof(size_t));
+  return value;
+}
+
 Bytes encode_size(void *elem) { return (Bytes){elem, sizeof(size_t)}; }
 
 void *decode_size(void *data, int size) {
@@ -154,10 +163,10 @@ Index *index_init(void) {
       ghash_load(TABLE_PATH_FILE_TO_SIZES, g_str_hash, g_str_equal, decode_str,
                  decode_size, g_free, g_free);
 
-  // Carrega a free list em formato extent map. Detecta automaticamente o
-  // formato antigo (slots individuais) e migra com coalescing — ver
-  // freelist_load em src/freelist.c.
-  freelist_load(TABLE_PATH_FREE_BLOCK_LIST, &index->free_list);
+  // Carrega a free list como lista de slots individuais (formato simples,
+  // pré-extent map). LIFO O(1) no consumo e libertação.
+  index->free_block_list =
+      gslist_load(TABLE_PATH_FREE_BLOCK_LIST, decode_free_block);
 
   pthread_mutex_init(&index->mutex, NULL);
 
@@ -178,7 +187,8 @@ void index_destroy(Index *index) {
                           encode_master_info);
   ghash_save(TABLE_PATH_FILE_TO_SIZES, index->file_to_sizes, encode_str,
              encode_size, FALSE, FALSE);
-  freelist_save(TABLE_PATH_FREE_BLOCK_LIST, &index->free_list);
+  gslist_save(TABLE_PATH_FREE_BLOCK_LIST, index->free_block_list,
+              encode_free_block);
 
   pthread_mutex_unlock(&index->mutex);
 
@@ -195,7 +205,7 @@ void index_destroy(Index *index) {
   g_hash_table_destroy(index->file_to_master);
   g_hash_table_destroy(index->hash_to_master);
   g_hash_table_destroy(index->file_to_sizes);
-  freelist_destroy(&index->free_list);
+  g_slist_free_full(index->free_block_list, free);
 
   pthread_mutex_destroy(&index->mutex);
   free(index);

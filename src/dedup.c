@@ -49,7 +49,6 @@
 #endif
 
 #include "dedup.h"
-#include "freelist.h"
 #include "hashing.h"
 #include "metaindex.h"
 #include "passthrough_helpers.h"
@@ -103,11 +102,13 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   remove_file_block(index, path, blockIndex);
   info->refcount--;
 
-  // Se mais ninguém referencia este bloco, devolve o slot à free list.
-  // O freelist_release faz coalescing com vizinhos adjacentes
-  // automaticamente (ver freelist.c).
+  // Se mais ninguém referencia este bloco, devolve o slot ao topo da
+  // free list (LIFO, O(1) em prepend).
   if (info->refcount == 0) {
-    freelist_release(&index->free_list, info->masterBlockIndex);
+    uint64_t *slot = malloc(sizeof(uint64_t));
+    *slot = info->masterBlockIndex;
+    index->free_block_list = g_slist_prepend(index->free_block_list, slot);
+
     remove_hash(index, info->hash);
     free(info);
   }
@@ -135,29 +136,33 @@ typedef struct {
 // Allocator storage-first
 // -----------------------------------------------------------------------------
 //
-// Filosofia: usar SEMPRE a free list antes de fazer append. Mesmo que os
-// extents sejam pequenos, são consumidos antes de o master crescer.
+// Filosofia: usar SEMPRE a free list antes de fazer append. Storage-first
+// — só fazemos crescer o master file quando a free list está vazia.
 //
-// Estratégia:
-//   - Se a free list tem >= miss_count slots livres, todos vêm de lá
-//     (best-fit por varrimento, possivelmente repartido por vários extents).
-//   - Caso contrário, drena tudo o que houver e completa com append.
+// Estratégia (LIFO O(1)):
+//   - Drena slots da head do GSList enquanto houver e ainda faltarem
+//     blocos no batch.
+//   - Resto vai por append (incremento de nextBlockIndex).
+//
+// Sem coalescing nem best-fit. Os slots saem na ordem LIFO em que foram
+// libertados, o que é suficiente: o caso comum no nosso workload é
+// append puro (free list vazia), e os reusos individuais não beneficiariam
+// de batching porque master_blk dispersos não cabem num único pwrite.
 static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
                                           uint64_t *next_block_index,
                                           uint64_t *out) {
-  uint64_t total = freelist_total_free(&idx->free_list);
-
-  if (total >= miss_count) {
-    // Caso ideal: a free list chega para tudo, o master não cresce.
-    freelist_take(&idx->free_list, miss_count, out);
-    return;
-  }
-
-  // Caso misto: drena a free list e completa com append.
   uint64_t taken = 0;
-  if (total > 0) {
-    taken = freelist_take(&idx->free_list, total, out);
+
+  // Drena a free list pela head (LIFO).
+  while (taken < miss_count && idx->free_block_list != NULL) {
+    GSList *head = idx->free_block_list;
+    uint64_t *slot = head->data;
+    out[taken++] = *slot;
+    idx->free_block_list = g_slist_delete_link(idx->free_block_list, head);
+    free(slot);
   }
+
+  // Remainder por append: o master cresce só agora, e só o necessário.
   for (uint64_t i = taken; i < miss_count; i++) {
     out[i] = (*next_block_index)++;
   }
@@ -247,12 +252,16 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
     }
   }
 
-  // Reverter MISSes: devolver master_blk à free list, libertar MasterInfo
-  // pendente. A free list aceita slots em qualquer ordem; o coalescing
-  // funde-os automaticamente se forem adjacentes.
+  // Reverter MISSes: devolver master_blk à free list (prepend O(1)),
+  // libertar MasterInfo pendente. A ordem em que voltam à free list é
+  // irrelevante (LIFO) e dado que master_blk grandes (appends) ficam na
+  // head, são consumidos primeiro no próximo write — antes de o master
+  // crescer.
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
-      freelist_release(&idx->free_list, plan[i].master_blk);
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].master_blk;
+      idx->free_block_list = g_slist_prepend(idx->free_block_list, slot);
       free(plan[i].info);
     }
   }
