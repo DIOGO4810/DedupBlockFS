@@ -102,6 +102,8 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
 
   // Allocate single buffer for all reads not one per group
   char *master_buf = malloc(num_blocks * BLOCK_SIZE);
+  if (master_buf == NULL)
+    return -ENOMEM;
 
   // Phase 3 & 4: Identify groups and read them
   size_t group_start = 0;
@@ -237,8 +239,11 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
 // a 1.
 //
 // Runs de tamanho 1 degeneram para 1 pwrite de 4 KiB.
-// HITs no meio do plan não impedem runs longos: simplesmente saltam-se,
-// porque os HITs não geram I/O.
+// HITs no meio do plan INTERROMPEM runs: se houver um HIT entre dois MISSes,
+// não é possível juntá-los num único pwrite porque os seus payloads não são
+// contíguos na memória (o buffer de input tem os dados do HIT no meio).
+// HITs só são "saltados" quando aparecem no início de uma janela não processada
+// (o while externo), nunca dentro de um run activo.
 //
 // Como funciona sem pwritev: dentro de um run os payloads são FISICAMENTE
 // contíguos no buffer de input do utilizador (a ordem do plan é a ordem
