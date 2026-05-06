@@ -1,29 +1,38 @@
 // =============================================================================
 // dedup.c — Camada de deduplicação a nível de bloco.
 //
-// `write_dedup` é a função central, e foi refactorizada para funcionar em
-// três passes:
+// `write_dedup` é a função central, refactorizada em três passes:
 //
 //   Passe 1 (decisão): para cada bloco lógico do request, calcula o hash e
 //                       decide se é HIT (já existe) ou MISS (novo). Para os
 //                       MISSes, cria um MasterInfo "pendente" sem o inserir
-//                       ainda no índice oficial. Aloca master_blk para todos
-//                       os MISSes em conjunto, no fim deste passe.
+//                       ainda no índice oficial.
+//
+//   Passe 1.5 (alocação): allocate_batch_storage_first atribui master_blk a
+//                       todos os MISSes — drena a free list LIFO antes de
+//                       fazer append (storage-first).
 //
 //   Passe 2 (flush):    agrupa MISSes com master_blk consecutivos em runs e
-//                       emite um único pwritev por run (pwrite quando run = 1).
-//                       Em caso de falha, faz rollback completo das alocações.
+//                       emite um único pwrite por run (pwrite individual
+//                       quando run = 1). Reusos da free list resultam em
+//                       runs de 1 (master_blk dispersos); appends agregam-se
+//                       num único run contíguo.
+//                       Em caso de falha, faz rollback completo.
 //
 //   Passe 3 (consolidação): só após o flush ter sucesso, insere os
 //                       MasterInfos pendentes em hash_to_master e os pares
 //                       (file, block) em file_to_master.
 //
 // Esta separação tem três objectivos:
-//   1. Reduzir N pwrite a 1 pwritev no caso comum (master_blk contíguos).
+//   1. Reduzir N pwrite a 1 pwrite no caso comum (master_blk contíguos).
 //   2. Garantir que se o flush falhar, o índice oficial não fica com entradas
 //      a apontar para blocos que nunca chegaram ao disco.
 //   3. Permitir que o allocator decida globalmente para o batch (e não bloco
 //      a bloco), o que é essencial para a política storage-first.
+//
+// `read_dedup` faz batching análogo no lado da leitura: ordena os blocos
+// pelo master_block_index, agrupa em runs físicos consecutivos e faz
+// 1 pread por run.
 // =============================================================================
 
 #include <stddef.h>
@@ -53,41 +62,91 @@
 #include "metaindex.h"
 #include "passthrough_helpers.h"
 
-// -----------------------------------------------------------------------------
-// Read path (inalterado conceptualmente — bloco a bloco com pread)
-// -----------------------------------------------------------------------------
-
-static int master_read(int fdMaster, off_t offset, char *buff) {
-  return pread(fdMaster, buff, BLOCK_SIZE, offset);
+static int cmp_master_idx(const void *a, const void *b) {
+  uint64_t ma = ((const BlockPair *)a)->master_block_index;
+  uint64_t mb = ((const BlockPair *)b)->master_block_index;
+  return (ma > mb) - (ma < mb);
 }
 
-// Single-lookup read: (file, blockIndex) -> MasterInfo -> master file
-static int read_block(int fdMaster, const char *path, uint64_t block_index,
-                      char *buff, Index *index) {
-  MasterInfo *info = lookup_by_file_block(index, path, block_index);
-  if (info == NULL)
-    return -1;
-  return master_read(fdMaster, info->masterBlockIndex * BLOCK_SIZE, buff);
-}
-
-// Read file content block by block from the master file.
-// For each logical block, we look up the MasterInfo and read from the master.
+// Read file with batching optimization.
+// Phase 1: Lookup all blocks to get their master positions
+// Phase 2: Sort pairs by master block index
+// Phase 3: Identify consecutive groups in physical space
+// Phase 4: Read each group with a single pread
+// Phase 5: Copy blocks to correct positions in output
 int read_dedup(Index *index, const char *path, char *buf, size_t size,
                off_t offset, int masterFd) {
-  ssize_t total_read = 0;
   size_t num_blocks = size / BLOCK_SIZE;
   uint64_t start_block = offset / BLOCK_SIZE;
-  int res = 0;
+
+  if (num_blocks == 0)
+    return 0;
+
+  // Phase 1: Lookup all blocks and create pairs
+  BlockPair pairs[num_blocks];
   for (size_t i = 0; i < num_blocks; i++) {
-    char buff[BLOCK_SIZE];
-    res = read_block(masterFd, path, start_block + i, buff, index);
-    if (res == -1) {
-      return res;
+    MasterInfo *info = lookup_by_file_block(index, path, start_block + i);
+    if (info == NULL) {
+      return -1;
     }
-    memcpy(buf + i * BLOCK_SIZE, buff, BLOCK_SIZE);
-    total_read += BLOCK_SIZE;
+    pairs[i].logical_idx = i;
+    pairs[i].master_block_index = info->masterBlockIndex;
   }
-  return total_read;
+
+  // Phase 2: Sort pairs by master block index
+  if (num_blocks <= INSERTION_SORT_THRESHOLD) {
+    insertion_sort(pairs, num_blocks);
+  } else {
+    qsort(pairs, num_blocks, sizeof(BlockPair), cmp_master_idx);
+  }
+
+  // Allocate single buffer for all reads not one per group
+  char *master_buf = malloc(num_blocks * BLOCK_SIZE);
+
+  // Phase 3 & 4: Identify groups and read them
+  size_t group_start = 0;
+  for (size_t i = 1; i <= num_blocks; i++) {
+    int is_last = (i == num_blocks);
+
+    int is_consec = !is_last && (pairs[i].master_block_index ==
+                                 pairs[i - 1].master_block_index + 1);
+    if (!is_last && is_consec)
+      continue;
+
+    // End of current group - read it
+    uint64_t min_master = pairs[group_start].master_block_index;
+    size_t blocks_in_group = i - group_start;
+
+    // Fast path: single block group
+    if (blocks_in_group == 1) {
+      size_t logical_idx = pairs[group_start].logical_idx;
+      char *dst = buf + logical_idx * BLOCK_SIZE;
+      ssize_t res = pread(masterFd, dst, BLOCK_SIZE, min_master * BLOCK_SIZE);
+      if (res != BLOCK_SIZE) {
+        free(master_buf);
+        return -1;
+      }
+    } else {
+      size_t read_size = blocks_in_group * BLOCK_SIZE;
+      ssize_t res =
+          pread(masterFd, master_buf, read_size, min_master * BLOCK_SIZE);
+      if (res != (ssize_t)read_size) {
+        free(master_buf);
+        return -1;
+      }
+      // Phase 5: Copy each block to correct position in output
+      for (size_t j = group_start; j < i; j++) {
+        size_t logical_idx = pairs[j].logical_idx;
+        uint64_t offset_in_range = pairs[j].master_block_index - min_master;
+        char *src = master_buf + offset_in_range * BLOCK_SIZE;
+        char *dst = buf + logical_idx * BLOCK_SIZE;
+        memcpy(dst, src, BLOCK_SIZE);
+      }
+    }
+    group_start = i;
+  }
+  free(master_buf);
+  return size;
 }
 
 // -----------------------------------------------------------------------------
@@ -115,8 +174,8 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
 }
 
 // =============================================================================
-// write_dedup — Reformulado em dois passes (Passe 1: decisão; Passe 2: flush;
-// Passe 3: consolidação).
+// write_dedup — três passes (Passe 1: decisão; Passe 1.5: alocação;
+// Passe 2: flush; Passe 3: consolidação).
 // =============================================================================
 
 // Estrutura efémera que representa cada bloco lógico do request durante
@@ -174,16 +233,18 @@ static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
 //
 // Um "run" é uma sequência de PlanEntries MISS consecutivas no plan cujos
 // master_blk são também consecutivos. Quando isso acontece, podemos emitir
-// um único pwritev em vez de N pwrite — N syscalls a 1.
+// um único pwrite que cobre todos os blocos do run de uma vez — N syscalls
+// a 1.
 //
 // Runs de tamanho 1 degeneram para 1 pwrite de 4 KiB.
 // HITs no meio do plan não impedem runs longos: simplesmente saltam-se,
 // porque os HITs não geram I/O.
 //
-// Sem pwritev: dentro de um run os payloads são FISICAMENTE contíguos
-// no buffer de input do utilizador (a ordem do plan é a ordem dos blocos
-// lógicos no buf). Logo o run inteiro pode ser escrito com um único
-// pwrite que parte de plan[run_start].payload e cobre run_len * BLOCK_SIZE.
+// Como funciona sem pwritev: dentro de um run os payloads são FISICAMENTE
+// contíguos no buffer de input do utilizador (a ordem do plan é a ordem
+// dos blocos lógicos no buf). Logo o run inteiro pode ser escrito com um
+// único pwrite que parte de plan[run_start].payload e cobre
+// run_len * BLOCK_SIZE.
 //
 // Retorna 0 em sucesso, -errno em falha. O caller é responsável pelo
 // rollback em caso de falha.
@@ -235,11 +296,13 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
 //   - Os HITs que tiveram refcount++ no Passe 1 são revertidos. Se um HIT
 //     for para um MasterInfo PENDENTE deste mesmo batch (intra-batch dedup),
 //     a libertação fica a cargo do MISS original.
-//   - `*next_block_index` é restaurado ao valor pré-batch, o que é seguro
-//     porque o mutex grosseiro impede que outra escrita o tenha tocado.
-static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
-                                  uint64_t *next_block_index,
-                                  uint64_t saved_next) {
+//
+// Nota sobre nextBlockIndex: NÃO restauramos nextBlockIndex porque os blocos
+// alocados por append já foram adicionados à free list (via g_slist_prepend
+// na secção dos MISSes abaixo). Restaurar nextBlockIndex criaria uma dupla
+// alocação: o mesmo índice ficaria tanto na free list como no ponto de
+// append, podendo ser atribuído duas vezes na próxima escrita.
+static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // Reverter HITs: decrementa refcount; se for um MasterInfo já no índice
   // oficial e o refcount cair a 0, restaurá-lo seria muito invasivo, e não
   // acontece neste cenário de erro local (o MasterInfo só estava no índice
@@ -253,10 +316,13 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
   }
 
   // Reverter MISSes: devolver master_blk à free list (prepend O(1)),
-  // libertar MasterInfo pendente. A ordem em que voltam à free list é
-  // irrelevante (LIFO) e dado que master_blk grandes (appends) ficam na
-  // head, são consumidos primeiro no próximo write — antes de o master
-  // crescer.
+  // libertar MasterInfo pendente. Tanto slots retirados da free list como
+  // slots alocados por append são devolvidos aqui — serão reutilizados nas
+  // próximas escritas via pop da head do GSList (LIFO).
+  //
+  // É por isto que NÃO restauramos nextBlockIndex: os índices alocados por
+  // append já estão na free list, restaurar nextBlockIndex criaria uma
+  // dupla alocação (mesmo índice na free list E como próximo append).
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_MISS) {
       uint64_t *slot = malloc(sizeof(uint64_t));
@@ -265,9 +331,6 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n,
       free(plan[i].info);
     }
   }
-
-  // Restaurar nextBlockIndex. Seguro sob mutex grosseiro.
-  *next_block_index = saved_next;
 }
 
 // -----------------------------------------------------------------------------
@@ -285,7 +348,6 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     return 0;
 
   uint64_t start_block = offset / BLOCK_SIZE;
-  uint64_t saved_next = *nextBlockIndex;
 
   // Plan vive na stack quando num_blocks é razoável. Para requests muito
   // grandes (muito raros — FUSE max_write costuma ser <= 1 MiB = 256 blocos),
@@ -375,15 +437,14 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // ---------------------------------------------------------------------------
-  // PASSE 2 — Flush. Emite pwritev/pwrite por runs contíguos.
+  // PASSE 2 — Flush. Emite pwrite por runs contíguos no master.
   // ---------------------------------------------------------------------------
   if (miss_count > 0) {
     int rc = flush_plan(masterFd, plan, num_blocks);
     if (rc < 0) {
-      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes,
-      // refcounts dos HITs e nextBlockIndex são restaurados.
-      rollback_allocations(index, plan, num_blocks, nextBlockIndex,
-                           saved_next);
+      // Erro de I/O: rollback completo. Free list, MasterInfos pendentes e
+      // refcounts dos HITs são revertidos.
+      rollback_allocations(index, plan, num_blocks);
       g_hash_table_destroy(pending_hashes);
       if (plan_heap)
         g_free(plan_heap);
