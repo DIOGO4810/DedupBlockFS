@@ -301,23 +301,25 @@ test_overwrite_full() {
 test_overwrite_via_dd_seek() {
   test_start "overwrite parcial (dd seek a meio)"
   local f="${MOUNT}/seek.bin"
+  local src_a=$(mktemp) src_b=$(mktemp) expected=$(mktemp)
+  trap 'rm -f "$src_a" "$src_b" "$expected"' RETURN
+
   # Cria ficheiro de 8 KiB (2 blocos) com pattern A.
-  dd if=/dev/urandom of=/tmp/A.bin bs=4096 count=2 status=none
-  cp /tmp/A.bin "$f"
+  dd if=/dev/urandom of="$src_a" bs=4096 count=2 status=none
+  cp "$src_a" "$f"
 
   # Sobrescreve apenas o 2º bloco com pattern B.
-  dd if=/dev/urandom of=/tmp/B.bin bs=4096 count=1 status=none
-  dd if=/tmp/B.bin of="$f" bs=4096 seek=1 conv=notrunc status=none
+  dd if=/dev/urandom of="$src_b" bs=4096 count=1 status=none
+  dd if="$src_b" of="$f" bs=4096 seek=1 conv=notrunc status=none
 
   # Resultado esperado: bloco 0 = primeiro 4K de A, bloco 1 = B.
-  local expected=$(mktemp)
-  head -c 4096 /tmp/A.bin > "$expected"
-  cat /tmp/B.bin >> "$expected"
+  head -c 4096 "$src_a" > "$expected"
+  cat "$src_b" >> "$expected"
 
   local md5_expected=$(md5_of "$expected")
   local md5_actual=$(md5_via_cat "$f")
 
-  rm -f /tmp/A.bin /tmp/B.bin "$expected"
+  rm -f "$src_a" "$src_b" "$expected"
   cleanup_fs
 
   if [[ "$md5_expected" == "$md5_actual" ]]; then pass; else
