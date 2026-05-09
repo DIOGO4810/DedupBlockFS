@@ -34,6 +34,7 @@
 #endif
 #include "dedup.h"
 #include <dirent.h>
+#include <stdatomic.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <fuse.h>
@@ -63,7 +64,10 @@ typedef struct context {
   FILE *fp;
   Index *index;
   int masterFd;
-  uint64_t nextBlockIndex;
+  // Atomic — múltiplas threads de write reservam ranges contíguos via
+  // __atomic_fetch_add (allocate_batch_storage_first em src/dedup.c).
+  // Inicializado em xmp_init (single-threaded antes do FUSE despachar).
+  _Atomic uint64_t nextBlockIndex;
 #ifdef DEBUG
   uint64_t create;
   uint64_t open;
@@ -104,7 +108,9 @@ static void *xmp_init(struct fuse_conn_info *conn, struct fuse_config *cfg) {
   ctx->masterFd = open("/masterFILE", O_RDWR | O_CREAT, 0666);
   struct stat stbuf;
   lstat("/masterFILE", &stbuf);
-  ctx->nextBlockIndex = stbuf.st_size / BLOCK_SIZE;
+  // atomic_init: stores iniciais a um _Atomic. xmp_init é single-thread
+  // (FUSE só começa a despachar requests depois desta função retornar).
+  atomic_init(&ctx->nextBlockIndex, stbuf.st_size / BLOCK_SIZE);
 
 #ifdef DEBUG
   ctx->open = 0;
@@ -377,10 +383,20 @@ static int xmp_chown(const char *path, uid_t uid, gid_t gid,
 
 // When a file is truncated, remove dedup references for the blocks
 // that are now beyond the new size, then shrink the actual file.
+//
+// A camada de dedup só opera com blocos alinhados a BLOCK_SIZE. Truncates
+// para size não-múltiplo de BLOCK_SIZE deixariam um bloco lógico parcial
+// onde o read_dedup leria 4 KiB inteiros, devolvendo bytes além do EOF
+// reportado por getattr. Para manter a invariante de alinhamento end-to-end
+// (consistente com o write_dedup), rejeitamos esses truncates.
 static int xmp_truncate(const char *path, off_t size,
                         struct fuse_file_info *fi) {
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)f_ctx->private_data;
+
+  // Rejeita size negativo (POSIX trata como erro) ou não-alinhado.
+  if (size < 0 || (size % BLOCK_SIZE) != 0)
+    return -EOPNOTSUPP;
 
   // Read lock para descobrir o intervalo de blocos a libertar.
   uint64_t new_block_count = 0;

@@ -301,6 +301,8 @@ test_overwrite_full() {
 test_overwrite_via_dd_seek() {
   test_start "overwrite parcial (dd seek a meio)"
   local f="${MOUNT}/seek.bin"
+  # Usa mktemp para evitar colisão com runs paralelas ou ficheiros
+  # pré-existentes em /tmp. Cleanup automático via trap RETURN.
   local src_a=$(mktemp) src_b=$(mktemp) expected=$(mktemp)
   trap 'rm -f "$src_a" "$src_b" "$expected"' RETURN
 
@@ -319,7 +321,6 @@ test_overwrite_via_dd_seek() {
   local md5_expected=$(md5_of "$expected")
   local md5_actual=$(md5_via_cat "$f")
 
-  rm -f "$src_a" "$src_b" "$expected"
   cleanup_fs
 
   if [[ "$md5_expected" == "$md5_actual" ]]; then pass; else

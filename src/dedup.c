@@ -291,7 +291,7 @@ typedef struct {
 // append puro (free list vazia), e os reusos individuais não beneficiariam
 // de batching porque master_blk dispersos não cabem num único pwrite.
 static void allocate_batch_storage_first(Index *idx, uint64_t miss_count,
-                                          uint64_t *next_block_index,
+                                          _Atomic uint64_t *next_block_index,
                                           uint64_t *out) {
   uint64_t taken = 0;
 
@@ -401,18 +401,35 @@ static int flush_plan(int masterFd, PlanEntry *plan, size_t n) {
 // alocação: o mesmo índice ficaria tanto na free list como no ponto de
 // append, podendo ser atribuído duas vezes na próxima escrita.
 static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
-  // Reverter HITs: decrementa refcount; se for um MasterInfo já no índice
-  // oficial e o refcount cair a 0, restaurá-lo seria muito invasivo, e não
-  // acontece neste cenário de erro local (o MasterInfo só estava no índice
-  // antes deste batch porque ALGUÉM ainda o referenciava).
-  // Para MasterInfos pendentes (intra-batch), a libertação acontece abaixo,
-  // no caminho dos MISSes.
+  // Reverter HITs: decrementa refcount atomicamente. Se o decrement
+  // levar refcount a 0 (caso patológico: outro thread fez unlink/truncate
+  // que removeu a última referência "real" entre o nosso Passe 1 e este
+  // rollback), temos de fazer cleanup completo, senão o MasterInfo fica
+  // preso em hash_to_master e o slot nunca volta à free list.
+  //
+  // Cleanup precisa de write lock no metadata_rwlock + freelist_mutex
+  // (lock hierarchy: metadata > freelist).
+  GSList *hit_slots_to_release = NULL;
+  pthread_rwlock_wrlock(&idx->metadata_rwlock);
   for (size_t i = 0; i < n; i++) {
-    if (plan[i].kind == PLAN_HIT) {
-      // Atomic decrement para reverter o increment do Passe 1.
-      // RELAXED: counter puro, sem ordering com mais nada.
-      __atomic_fetch_sub(&plan[i].info->refcount, 1, __ATOMIC_RELAXED);
+    if (plan[i].kind != PLAN_HIT)
+      continue;
+    if (__atomic_fetch_sub(&plan[i].info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+      // Caímos a 0. Cleanup do MasterInfo.
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = plan[i].info->masterBlockIndex;
+      hit_slots_to_release = g_slist_prepend(hit_slots_to_release, slot);
+      remove_hash(idx, plan[i].info->hash);
+      g_free(plan[i].info);
     }
+  }
+  pthread_rwlock_unlock(&idx->metadata_rwlock);
+
+  if (hit_slots_to_release != NULL) {
+    pthread_mutex_lock(&idx->freelist_mutex);
+    idx->free_block_list =
+        g_slist_concat(hit_slots_to_release, idx->free_block_list);
+    pthread_mutex_unlock(&idx->freelist_mutex);
   }
 
   // Reverter MISSes: devolver master_blk à free list (prepend O(1)),
@@ -442,7 +459,8 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
 // -----------------------------------------------------------------------------
 
 int write_dedup(Index *index, const char *path, const char *buf, size_t size,
-                off_t offset, int masterFd, uint64_t *nextBlockIndex) {
+                off_t offset, int masterFd,
+                _Atomic uint64_t *nextBlockIndex) {
   // Caso degenerado: write de 0 bytes não faz nada.
   if (size == 0)
     return 0;
@@ -603,17 +621,39 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
   }
 
   // Insere os mapeamentos (file, block) → MasterInfo para todos.
-  // Se este write faz overwrite do mesmo bloco lógico, remove primeiro
-  // o mapping anterior para decrementar o refcount do MasterInfo antigo
-  // e libertar o slot físico quando o contador chegar a zero.
+  //
+  // Tratamento de OVERWRITE: se já existe uma entrada (path, logical_blk)
+  // a apontar para um MasterInfo antigo, temos de decrementar o refcount
+  // desse MasterInfo. Sem isto, o info fica órfão em hash_to_master
+  // (refcount nunca chega a 0) e o slot no master nunca volta à free
+  // list — leak permanente que se acumula com cada overwrite.
+  //
+  // Caso especial: se old == plan[i].info (overwrite com mesmo conteúdo
+  // ou mesmo MasterInfo via dedup), o increment do Passe 1 e o decrement
+  // aqui cancelam-se. O refcount permanece correcto porque a entrada no
+  // file_to_master substitui-se sem novo titular.
+  //
+  // (Nota: o Copilot Autofix em f6e5cd0 sugeriu chamar remove_block_dedup
+  // mas usou nome errado — `lookup_file_block` em vez de
+  // `lookup_by_file_block`, que não existe; aliás chamar
+  // remove_block_dedup faz um lookup duplo desnecessário. Esta versão
+  // faz lookup uma vez e decrementa inline.)
   for (size_t i = 0; i < num_blocks; i++) {
-    MasterInfo *existing =
-        lookup_file_block(index, path, plan[i].logical_blk);
-
-    if (existing != NULL && existing != plan[i].info) {
-      remove_block_dedup(index, path, plan[i].logical_blk);
+    MasterInfo *old =
+        lookup_by_file_block(index, path, plan[i].logical_blk);
+    if (old != NULL) {
+      // Decrement atómico do antigo. ACQ_REL: vê estado consistente do
+      // MasterInfo se ganharmos a corrida ao 0.
+      if (__atomic_fetch_sub(&old->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+        // Último titular — cleanup completo. Slot vai à free list (o
+        // concat é feito num único acquire no fim do Passe 3).
+        uint64_t *slot = malloc(sizeof(uint64_t));
+        *slot = old->masterBlockIndex;
+        slots_to_release = g_slist_prepend(slots_to_release, slot);
+        remove_hash(index, old->hash);
+        g_free(old);
+      }
     }
-
     insert_file_block(index, path, plan[i].logical_blk, plan[i].info);
   }
 
