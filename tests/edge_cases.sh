@@ -1,0 +1,550 @@
+#!/usr/bin/env bash
+# -----------------------------------------------------------------------------
+# tests/edge_cases.sh — Suite extensa de testes de correctude.
+#
+# Cobre cenários que tests/concurrent_roundtrip.sh não toca:
+#   - EOF e tamanhos não-alinhados a BLOCK_SIZE
+#   - Ficheiros vazios e sub-bloco
+#   - Dedup single-thread (mesmo conteúdo, master não cresce duas vezes)
+#   - Dedup cross-thread (força double-check insert)
+#   - Overwrite total e parcial
+#   - Truncate shrink (xmp_truncate + remove_blocks_dedup_batch)
+#   - Read concorrente com write no mesmo ficheiro
+#   - Unlink durante write em loop
+#   - Reuso de free list (master não cresce desnecessariamente)
+#   - Muitos ficheiros pequenos em paralelo
+#
+# Uso (FUSE já montado em /mnt/fs):
+#   ./tests/edge_cases.sh
+# -----------------------------------------------------------------------------
+set -uo pipefail   # NÃO -e: queremos somar falhas e reportar no fim
+
+if [[ -t 1 ]]; then
+  GREEN=$'\033[0;32m'; RED=$'\033[0;31m'; YELLOW=$'\033[0;33m'
+  BLUE=$'\033[0;34m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+else
+  GREEN='' RED='' YELLOW='' BLUE='' BOLD='' RESET=''
+fi
+
+MOUNT="/mnt/fs"
+[[ -d "$MOUNT" ]] || { echo "${RED}ERRO: $MOUNT não existe${RESET}" >&2; exit 2; }
+mountpoint -q "$MOUNT" || { echo "${RED}ERRO: $MOUNT não está montado${RESET}" >&2; exit 2; }
+
+TESTS_TOTAL=0
+TESTS_PASSED=0
+TESTS_FAILED=0
+FAILED_NAMES=()
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+# Cleanup de ficheiros num directório do FS após cada teste.
+cleanup_fs() {
+  rm -f "${MOUNT}"/* 2>/dev/null || true
+}
+
+# Lê ficheiro do FS via cat (evita mmap, que falha sob direct_io=1).
+md5_via_cat() {
+  cat "$1" | md5sum | awk '{print $1}'
+}
+
+md5_of() {
+  md5sum "$1" | awk '{print $1}'
+}
+
+# Tamanho do master file em bytes (0 se não existir).
+master_size() {
+  stat -c '%s' /masterFILE 2>/dev/null || echo 0
+}
+
+# Helper de teste: regista resultado e imprime status.
+test_start() {
+  TESTS_TOTAL=$((TESTS_TOTAL + 1))
+  echo "  ${BLUE}▶${RESET} $1"
+}
+
+pass() {
+  TESTS_PASSED=$((TESTS_PASSED + 1))
+  echo "    ${GREEN}✓ PASS${RESET}"
+}
+
+fail() {
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  FAILED_NAMES+=( "$1" )
+  echo "    ${RED}✗ FAIL: $2${RESET}"
+}
+
+# Lança N comandos shell em paralelo. Retorna 0 se TODOS passarem.
+# Uso: parallel_run "cmd1" "cmd2" "cmd3" ...
+parallel_run() {
+  local pids=()
+  for cmd in "$@"; do
+    bash -c "$cmd" &
+    pids+=($!)
+  done
+  local rc=0
+  for pid in "${pids[@]}"; do
+    wait "$pid" || rc=1
+  done
+  return $rc
+}
+
+# =============================================================================
+# Testes
+# =============================================================================
+
+# --- 1. EOF e tamanhos não-alinhados -----------------------------------------
+
+test_empty_file() {
+  test_start "ficheiro vazio (touch + md5)"
+  local f="${MOUNT}/empty.bin"
+  : > "$f"
+  local md5
+  md5=$(md5_via_cat "$f")
+  if [[ "$md5" == "d41d8cd98f00b204e9800998ecf8427e" ]]; then
+    pass
+  else
+    fail "test_empty_file" "md5 vazio esperado, got $md5"
+  fi
+  cleanup_fs
+}
+
+test_sub_block_file() {
+  test_start "ficheiro sub-bloco (100 bytes)"
+  local f="${MOUNT}/tiny.bin"
+  printf 'a%.0s' {1..100} > "$f"
+  local size_reported size_expected=100
+  size_reported=$(stat -c '%s' "$f")
+  local content
+  content=$(cat "$f")
+  if [[ "$size_reported" == "$size_expected" && "${#content}" == "$size_expected" ]]; then
+    pass
+  else
+    fail "test_sub_block_file" "size=$size_reported expected=$size_expected, content_len=${#content}"
+  fi
+  cleanup_fs
+}
+
+test_exactly_one_block() {
+  test_start "exactamente 1 bloco (4096 bytes)"
+  local src=$(mktemp) f="${MOUNT}/onek.bin"
+  dd if=/dev/urandom of="$src" bs=4096 count=1 status=none
+  cp "$src" "$f"
+  local md5_src=$(md5_of "$src") md5_dst=$(md5_via_cat "$f")
+  rm -f "$src"
+  if [[ "$md5_src" == "$md5_dst" ]]; then pass; else
+    fail "test_exactly_one_block" "$md5_src != $md5_dst"
+  fi
+  cleanup_fs
+}
+
+test_unaligned_size() {
+  test_start "tamanho não-alinhado (12345 bytes)"
+  local src=$(mktemp) f="${MOUNT}/unaligned.bin"
+  dd if=/dev/urandom of="$src" bs=1 count=12345 status=none
+  cp "$src" "$f"
+  local size_reported=$(stat -c '%s' "$f")
+  local md5_src=$(md5_of "$src") md5_dst=$(md5_via_cat "$f")
+  rm -f "$src"
+  if [[ "$size_reported" == "12345" && "$md5_src" == "$md5_dst" ]]; then
+    pass
+  else
+    fail "test_unaligned_size" "size=$size_reported md5_src=$md5_src md5_dst=$md5_dst"
+  fi
+  cleanup_fs
+}
+
+test_read_past_eof() {
+  test_start "read past EOF retorna 0 (não erro)"
+  local src=$(mktemp) f="${MOUNT}/eof.bin"
+  dd if=/dev/urandom of="$src" bs=4096 count=1 status=none
+  cp "$src" "$f"
+  # tail -c +N começa na byte N. Se pedir além do tamanho, deve dar vazio.
+  local out=$(tail -c +99999 "$f" 2>&1)
+  local rc=$?
+  rm -f "$src"
+  if [[ $rc -eq 0 && -z "$out" ]]; then pass; else
+    fail "test_read_past_eof" "rc=$rc out_len=${#out}"
+  fi
+  cleanup_fs
+}
+
+# --- 2. Dedup ---------------------------------------------------------------
+
+test_dedup_single_thread_same_content() {
+  test_start "dedup single-thread (mesmo conteúdo → master não cresce 2x)"
+  cleanup_fs
+  local src=$(mktemp)
+  dd if=/dev/urandom of="$src" bs=1M count=4 status=none
+
+  local size_before=$(master_size)
+  cp "$src" "${MOUNT}/dup1.bin"
+  local size_after_first=$(master_size)
+  cp "$src" "${MOUNT}/dup2.bin"
+  local size_after_second=$(master_size)
+
+  local first_growth=$((size_after_first - size_before))
+  local second_growth=$((size_after_second - size_after_first))
+
+  rm -f "$src"
+  cleanup_fs
+
+  # Primeiro write cresce ~4 MiB. Segundo NÃO deveria crescer (todos HITs).
+  if [[ $first_growth -ge 4194304 && $second_growth -eq 0 ]]; then
+    pass
+  else
+    fail "test_dedup_single_thread_same_content" \
+         "first=$first_growth (esperado >=4MiB), second=$second_growth (esperado 0)"
+  fi
+}
+
+test_dedup_cross_thread() {
+  test_start "dedup cross-thread (8 threads escrevem mesmo conteúdo em paralelo)"
+  cleanup_fs
+  local shared=$(mktemp)
+  dd if=/dev/urandom of="$shared" bs=1M count=4 status=none
+
+  local size_before=$(master_size)
+
+  # Lança 8 threads, todas a escrever o MESMO conteúdo em ficheiros distintos.
+  # Vai forçar race no double-check insert.
+  local pids=()
+  for i in {1..8}; do
+    cp "$shared" "${MOUNT}/cross_$i.bin" &
+    pids+=($!)
+  done
+  local rc=0
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+
+  sync
+  local size_after=$(master_size)
+  local growth=$((size_after - size_before))
+
+  # Verifica md5 round-trip de cada um.
+  local md5_shared=$(md5_of "$shared")
+  local all_ok=1
+  for i in {1..8}; do
+    local md5_dst=$(md5_via_cat "${MOUNT}/cross_$i.bin")
+    if [[ "$md5_dst" != "$md5_shared" ]]; then all_ok=0; break; fi
+  done
+
+  rm -f "$shared"
+  cleanup_fs
+
+  # Esperamos: master cresce ~4 MiB (1 cópia). Sob double-check insert
+  # com colisões muito rápidas, pode crescer um pouco mais (pwrites
+  # desperdiçados que vão à freelist), mas tipicamente <2× o conteúdo.
+  local max_growth=$((8388608))   # 8 MiB tolerance (2× o conteúdo único)
+
+  if [[ $rc -eq 0 && $all_ok -eq 1 && $growth -le $max_growth ]]; then
+    echo "    ${YELLOW}info: master cresceu ${growth} bytes (esperado ~4MiB, tolerância <=8MiB)${RESET}"
+    pass
+  else
+    fail "test_dedup_cross_thread" \
+         "rc=$rc md5_ok=$all_ok growth=$growth (max permitido $max_growth)"
+  fi
+}
+
+# --- 3. Overwrite -----------------------------------------------------------
+
+test_overwrite_full() {
+  test_start "overwrite total (mesmo tamanho)"
+  local f="${MOUNT}/over.bin"
+  local src1=$(mktemp) src2=$(mktemp)
+  dd if=/dev/urandom of="$src1" bs=1M count=2 status=none
+  dd if=/dev/urandom of="$src2" bs=1M count=2 status=none
+
+  cp "$src1" "$f"
+  local md5_first=$(md5_via_cat "$f")
+  cp "$src2" "$f"     # overwrite
+  local md5_second=$(md5_via_cat "$f")
+
+  local md5_src2=$(md5_of "$src2")
+  rm -f "$src1" "$src2"
+  cleanup_fs
+
+  if [[ "$md5_second" == "$md5_src2" && "$md5_first" != "$md5_second" ]]; then
+    pass
+  else
+    fail "test_overwrite_full" "md5_second=$md5_second md5_src2=$md5_src2"
+  fi
+}
+
+test_overwrite_via_dd_seek() {
+  test_start "overwrite parcial (dd seek a meio)"
+  local f="${MOUNT}/seek.bin"
+  # Cria ficheiro de 8 KiB (2 blocos) com pattern A.
+  dd if=/dev/urandom of=/tmp/A.bin bs=4096 count=2 status=none
+  cp /tmp/A.bin "$f"
+
+  # Sobrescreve apenas o 2º bloco com pattern B.
+  dd if=/dev/urandom of=/tmp/B.bin bs=4096 count=1 status=none
+  dd if=/tmp/B.bin of="$f" bs=4096 seek=1 conv=notrunc status=none
+
+  # Resultado esperado: bloco 0 = primeiro 4K de A, bloco 1 = B.
+  local expected=$(mktemp)
+  head -c 4096 /tmp/A.bin > "$expected"
+  cat /tmp/B.bin >> "$expected"
+
+  local md5_expected=$(md5_of "$expected")
+  local md5_actual=$(md5_via_cat "$f")
+
+  rm -f /tmp/A.bin /tmp/B.bin "$expected"
+  cleanup_fs
+
+  if [[ "$md5_expected" == "$md5_actual" ]]; then pass; else
+    fail "test_overwrite_via_dd_seek" "expected=$md5_expected actual=$md5_actual"
+  fi
+}
+
+# --- 4. Truncate shrink -----------------------------------------------------
+
+test_truncate_shrink() {
+  test_start "truncate shrink (8 MiB → 2 MiB)"
+  local src=$(mktemp) f="${MOUNT}/trunc.bin"
+  dd if=/dev/urandom of="$src" bs=1M count=8 status=none
+  cp "$src" "$f"
+
+  truncate -s 2097152 "$f"     # 2 MiB
+
+  local size_after=$(stat -c '%s' "$f")
+  local md5_first2mb=$(head -c 2097152 "$src" | md5sum | awk '{print $1}')
+  local md5_actual=$(md5_via_cat "$f")
+
+  rm -f "$src"
+  cleanup_fs
+
+  if [[ "$size_after" == "2097152" && "$md5_first2mb" == "$md5_actual" ]]; then
+    pass
+  else
+    fail "test_truncate_shrink" "size=$size_after md5_first2mb=$md5_first2mb md5_actual=$md5_actual"
+  fi
+}
+
+test_truncate_to_zero() {
+  test_start "truncate to 0 (apaga blocos, master reusa)"
+  local src=$(mktemp) f="${MOUNT}/trunc0.bin"
+  dd if=/dev/urandom of="$src" bs=1M count=4 status=none
+  cp "$src" "$f"
+  truncate -s 0 "$f"
+  local size_after=$(stat -c '%s' "$f")
+  local content=$(cat "$f")
+  rm -f "$src"
+  cleanup_fs
+  if [[ "$size_after" == "0" && -z "$content" ]]; then pass; else
+    fail "test_truncate_to_zero" "size=$size_after content_len=${#content}"
+  fi
+}
+
+# --- 5. Concorrência avançada -----------------------------------------------
+
+test_concurrent_read_during_write() {
+  test_start "read concorrente em ficheiro estável durante writes noutros"
+  cleanup_fs
+  # Cria um ficheiro estável que será lido em loop.
+  local stable_src=$(mktemp)
+  dd if=/dev/urandom of="$stable_src" bs=1M count=4 status=none
+  cp "$stable_src" "${MOUNT}/stable.bin"
+  local md5_stable=$(md5_of "$stable_src")
+
+  # Lança um leitor em loop e vários escritores.
+  (
+    for _ in {1..30}; do
+      local md5_read=$(md5_via_cat "${MOUNT}/stable.bin")
+      if [[ "$md5_read" != "$md5_stable" ]]; then
+        echo "READER: md5 divergiu! got=$md5_read expected=$md5_stable" >&2
+        exit 1
+      fi
+    done
+  ) &
+  local reader_pid=$!
+
+  # 4 escritores em paralelo (ficheiros distintos).
+  local writer_pids=()
+  for i in {1..4}; do
+    (
+      local s=$(mktemp)
+      dd if=/dev/urandom of="$s" bs=1M count=2 status=none
+      cp "$s" "${MOUNT}/w_$i.bin"
+      rm -f "$s"
+    ) &
+    writer_pids+=($!)
+  done
+
+  local rc=0
+  for pid in "${writer_pids[@]}"; do wait "$pid" || rc=1; done
+  wait $reader_pid || rc=1
+
+  rm -f "$stable_src"
+  cleanup_fs
+  if [[ $rc -eq 0 ]]; then pass; else
+    fail "test_concurrent_read_during_write" "leitor reportou divergência ou writer falhou"
+  fi
+}
+
+test_concurrent_unlink_during_writes() {
+  test_start "unlink concorrente com writes noutros ficheiros"
+  cleanup_fs
+  # Pré-cria 4 ficheiros que vão ser apagados.
+  for i in {1..4}; do
+    dd if=/dev/urandom of="${MOUNT}/del_$i.bin" bs=1M count=2 status=none
+  done
+
+  # Em paralelo: 4 unlinks + 4 writes em ficheiros novos.
+  local pids=()
+  for i in {1..4}; do
+    rm -f "${MOUNT}/del_$i.bin" &
+    pids+=($!)
+  done
+  for i in {1..4}; do
+    (
+      local s=$(mktemp)
+      dd if=/dev/urandom of="$s" bs=1M count=2 status=none
+      cp "$s" "${MOUNT}/new_$i.bin"
+      rm -f "$s"
+    ) &
+    pids+=($!)
+  done
+
+  local rc=0
+  for pid in "${pids[@]}"; do wait "$pid" || rc=1; done
+
+  # Verifica estado final: del_*.bin não devem existir, new_*.bin sim.
+  local del_remaining=$(ls "${MOUNT}"/del_*.bin 2>/dev/null | wc -l)
+  local new_count=$(ls "${MOUNT}"/new_*.bin 2>/dev/null | wc -l)
+
+  cleanup_fs
+
+  if [[ $rc -eq 0 && $del_remaining -eq 0 && $new_count -eq 4 ]]; then pass; else
+    fail "test_concurrent_unlink_during_writes" \
+         "rc=$rc del_remaining=$del_remaining new_count=$new_count"
+  fi
+}
+
+# --- 6. Reuso da free list --------------------------------------------------
+
+test_freelist_reuse() {
+  test_start "free list reuse (write→unlink→write não cresce master)"
+  cleanup_fs
+  local src=$(mktemp)
+  dd if=/dev/urandom of="$src" bs=1M count=4 status=none
+
+  cp "$src" "${MOUNT}/r1.bin"
+  sync
+  local size_after_first=$(master_size)
+
+  rm -f "${MOUNT}/r1.bin"
+  sync
+
+  # Segundo write com conteúdo diferente — deve consumir slots libertados.
+  local src2=$(mktemp)
+  dd if=/dev/urandom of="$src2" bs=1M count=4 status=none
+  cp "$src2" "${MOUNT}/r2.bin"
+  sync
+  local size_after_second=$(master_size)
+
+  local growth=$((size_after_second - size_after_first))
+
+  rm -f "$src" "$src2"
+  cleanup_fs
+
+  # Master cresceu na primeira escrita. Na segunda devia crescer 0
+  # (todos os slots vieram da free list).
+  if [[ $growth -eq 0 ]]; then pass; else
+    fail "test_freelist_reuse" "master cresceu $growth bytes na 2ª escrita (esperado 0)"
+  fi
+}
+
+# --- 7. Stress generalizado --------------------------------------------------
+
+test_many_small_files_concurrent() {
+  test_start "100 ficheiros pequenos criados em paralelo"
+  cleanup_fs
+  local pids=()
+  for i in {1..100}; do
+    (
+      printf 'data_%d\n' "$i" > "${MOUNT}/many_$i.txt"
+    ) &
+    pids+=($!)
+    # Limita paralelismo para não esgotar fork.
+    if [[ ${#pids[@]} -ge 20 ]]; then
+      for pid in "${pids[@]}"; do wait "$pid"; done
+      pids=()
+    fi
+  done
+  for pid in "${pids[@]}"; do wait "$pid"; done
+
+  local count=$(ls "${MOUNT}"/many_*.txt 2>/dev/null | wc -l)
+  # Verifica conteúdo de uma amostra.
+  local sample_ok=1
+  for i in 1 50 100; do
+    local content=$(cat "${MOUNT}/many_$i.txt")
+    if [[ "$content" != "data_$i" ]]; then sample_ok=0; break; fi
+  done
+
+  cleanup_fs
+
+  if [[ $count -eq 100 && $sample_ok -eq 1 ]]; then pass; else
+    fail "test_many_small_files_concurrent" "count=$count sample_ok=$sample_ok"
+  fi
+}
+
+# =============================================================================
+# Main
+# =============================================================================
+
+echo
+echo "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+echo "${BOLD}  Edge cases suite — exercitando caminhos não cobertos pelo${RESET}"
+echo "${BOLD}  concurrent_roundtrip.sh${RESET}"
+echo "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+echo
+
+echo "${BOLD}1. EOF e tamanhos não-alinhados${RESET}"
+test_empty_file
+test_sub_block_file
+test_exactly_one_block
+test_unaligned_size
+test_read_past_eof
+
+echo
+echo "${BOLD}2. Dedup${RESET}"
+test_dedup_single_thread_same_content
+test_dedup_cross_thread
+
+echo
+echo "${BOLD}3. Overwrite${RESET}"
+test_overwrite_full
+test_overwrite_via_dd_seek
+
+echo
+echo "${BOLD}4. Truncate${RESET}"
+test_truncate_shrink
+test_truncate_to_zero
+
+echo
+echo "${BOLD}5. Concorrência avançada${RESET}"
+test_concurrent_read_during_write
+test_concurrent_unlink_during_writes
+
+echo
+echo "${BOLD}6. Reuso da free list${RESET}"
+test_freelist_reuse
+
+echo
+echo "${BOLD}7. Stress generalizado${RESET}"
+test_many_small_files_concurrent
+
+# Resumo final
+echo
+echo "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+echo "Total: $TESTS_TOTAL  ${GREEN}Passed: $TESTS_PASSED${RESET}  ${RED}Failed: $TESTS_FAILED${RESET}"
+if [[ $TESTS_FAILED -gt 0 ]]; then
+  echo
+  echo "${RED}Falharam:${RESET}"
+  for n in "${FAILED_NAMES[@]}"; do echo "  - $n"; done
+  exit 1
+fi
+echo "${GREEN}${BOLD}✓ Todos os edge cases passaram${RESET}"
+exit 0

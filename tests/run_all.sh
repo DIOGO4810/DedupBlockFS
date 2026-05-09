@@ -124,6 +124,10 @@ else
   ok "16×8 MiB concorrente"
 fi
 
+step "Edge cases (suite extensa de cenários)"
+./tests/edge_cases.sh
+ok "edge cases"
+
 step "Stress: criar + apagar concorrente"
 # Cria 4 ficheiros em paralelo, depois apaga em paralelo, várias vezes.
 # Exercita o caminho remove_blocks_dedup_batch sob contenção.
