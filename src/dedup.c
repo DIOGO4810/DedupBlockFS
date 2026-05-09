@@ -196,6 +196,56 @@ void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// remove_blocks_dedup_batch — versão batch para xmp_unlink/xmp_truncate.
+// -----------------------------------------------------------------------------
+//
+// Adquire metadata_rwlock em write mode 1 vez, faz lookup+remove para
+// todos os blocos no intervalo [start_block, end_block), recolhe os
+// slots que cairam a refcount=0 num GSList local, liberta o
+// metadata_rwlock e finalmente prepende o GSList local à free list
+// global num único acquire do freelist_mutex.
+//
+// Custo: 2 acquires de locks no total, em vez de 2N do loop ingénuo
+// (1 acquire de metadata_rwlock + 1 acquire de freelist_mutex por
+// bloco). Mais eficiente para ficheiros grandes.
+void remove_blocks_dedup_batch(Index *index, const char *path,
+                                uint64_t start_block, uint64_t end_block) {
+  if (start_block >= end_block)
+    return;
+
+  // GSList local com os slots a libertar — construído sob metadata_rwlock,
+  // depois concat'd à free list global.
+  GSList *to_release = NULL;
+
+  pthread_rwlock_wrlock(&index->metadata_rwlock);
+  for (uint64_t i = start_block; i < end_block; i++) {
+    MasterInfo *info = lookup_by_file_block(index, path, i);
+    if (info == NULL)
+      continue;
+
+    remove_file_block(index, path, i);
+
+    // Decrement atómico — coordenado com Passe 1 do write_dedup que
+    // pode estar a fazer increments noutros threads.
+    if (__atomic_fetch_sub(&info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+      uint64_t *slot = malloc(sizeof(uint64_t));
+      *slot = info->masterBlockIndex;
+      to_release = g_slist_prepend(to_release, slot);
+      remove_hash(index, info->hash);
+      free(info);
+    }
+  }
+  pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  // Concat à free list global num único acquire (em vez de N prepends).
+  if (to_release != NULL) {
+    pthread_mutex_lock(&index->freelist_mutex);
+    index->free_block_list = g_slist_concat(to_release, index->free_block_list);
+    pthread_mutex_unlock(&index->freelist_mutex);
+  }
+}
+
 // =============================================================================
 // write_dedup — três passes (Passe 1: decisão; Passe 1.5: alocação;
 // Passe 2: flush; Passe 3: consolidação).

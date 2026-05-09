@@ -268,22 +268,28 @@ static int xmp_unlink(const char *path) {
   //         gettid(), path, f_ctx->uid, f_ctx->pid);
 #endif
 
-  // Write lock — vamos modificar metadata (file_to_master via
-  // remove_block_dedup, hash_to_master, file_to_sizes). Commit 4
-  // refactoriza isto para batch (remove_blocks_dedup_batch); por
-  // agora mantém-se em loop sob write lock.
-  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+  // Lê o tamanho lógico sob read lock para descobrir quantos blocos
+  // libertar. Liberta o lock antes de chamar remove_blocks_dedup_batch
+  // (que pega write lock internamente).
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+  uint64_t num_blocks = 0;
+  int has_blocks = 0;
   if (logical_size != NULL) {
-    // walk through every block of the file and remove its reference
-    uint64_t num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (uint64_t i = 0; i < num_blocks; i++) {
-      remove_block_dedup(p_ctx->index, path, i);
-    }
-    // remove the file size entry itself
-    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+    num_blocks = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    has_blocks = 1;
   }
   pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+
+  if (has_blocks) {
+    // Liberta todas as referências em batch — 1 acquire de cada lock.
+    remove_blocks_dedup_batch(p_ctx->index, path, 0, num_blocks);
+
+    // Remove a entrada de file_to_sizes — write lock breve.
+    pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+    g_hash_table_remove(p_ctx->index->file_to_sizes, path);
+    pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+  }
 
   // now actually delete the file
   int res = unlink(path);
@@ -376,20 +382,32 @@ static int xmp_truncate(const char *path, off_t size,
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)f_ctx->private_data;
 
-  // Write lock para remove_block_dedup e update do logical_size.
-  // Commit 4 refactoriza para batch.
-  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+  // Read lock para descobrir o intervalo de blocos a libertar.
+  uint64_t new_block_count = 0;
+  uint64_t old_block_count = 0;
+  int needs_truncate_blocks = 0;
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL && (size_t)size < *logical_size) {
-    // only the blocks past the new size need to be removed
-    uint64_t new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    uint64_t old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    for (uint64_t i = new_block_count; i < old_block_count; i++) {
-      remove_block_dedup(p_ctx->index, path, i);
-    }
-    *logical_size = size;
+    new_block_count = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    old_block_count = (*logical_size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    needs_truncate_blocks = 1;
   }
   pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+
+  if (needs_truncate_blocks) {
+    // Liberta as referências em batch.
+    remove_blocks_dedup_batch(p_ctx->index, path, new_block_count,
+                               old_block_count);
+
+    // Actualiza o tamanho lógico — write lock breve.
+    pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
+    size_t *ls = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
+    if (ls != NULL && (size_t)size < *ls) {
+      *ls = size;
+    }
+    pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
+  }
 
   int res;
   if (fi != NULL)
