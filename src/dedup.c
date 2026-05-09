@@ -87,38 +87,47 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
   // paralelo. Copiamos master_block_index para o array local; NÃO
   // guardamos o ponteiro MasterInfo* (pode ser libertado por
   // remove_block_dedup assim que libertarmos o read lock).
+  //
+  // Se um lookup falhar, é EOF (caller pediu além do tamanho do
+  // ficheiro). Param-se os lookups e devolvem-se só os blocos que
+  // tinham mapeamento. POSIX: read past EOF retorna < size, eventualmente 0.
   BlockPair pairs[num_blocks];
+  size_t valid_blocks = 0;
   pthread_rwlock_rdlock(&index->metadata_rwlock);
   for (size_t i = 0; i < num_blocks; i++) {
     MasterInfo *info = lookup_by_file_block(index, path, start_block + i);
     if (info == NULL) {
-      pthread_rwlock_unlock(&index->metadata_rwlock);
-      return -1;
+      // EOF — não há mais blocos lógicos. Devolvemos só os já lidos.
+      break;
     }
-    pairs[i].logical_idx = i;
-    pairs[i].master_block_index = info->masterBlockIndex;
+    pairs[valid_blocks].logical_idx = i;
+    pairs[valid_blocks].master_block_index = info->masterBlockIndex;
+    valid_blocks++;
   }
   pthread_rwlock_unlock(&index->metadata_rwlock);
+
+  if (valid_blocks == 0)
+    return 0;  // EOF imediato.
 
   // Phases 2-5 correm SEM LOCK. Os pairs[] são locais, e os preads
   // a offsets disjuntos no master file são thread-safe por POSIX.
 
   // Phase 2: Sort pairs by master block index
-  if (num_blocks <= INSERTION_SORT_THRESHOLD) {
-    insertion_sort(pairs, num_blocks);
+  if (valid_blocks <= INSERTION_SORT_THRESHOLD) {
+    insertion_sort(pairs, valid_blocks);
   } else {
-    qsort(pairs, num_blocks, sizeof(BlockPair), cmp_master_idx);
+    qsort(pairs, valid_blocks, sizeof(BlockPair), cmp_master_idx);
   }
 
   // Allocate single buffer for all reads not one per group
-  char *master_buf = malloc(num_blocks * BLOCK_SIZE);
+  char *master_buf = malloc(valid_blocks * BLOCK_SIZE);
   if (master_buf == NULL)
     return -ENOMEM;
 
   // Phase 3 & 4: Identify groups and read them
   size_t group_start = 0;
-  for (size_t i = 1; i <= num_blocks; i++) {
-    int is_last = (i == num_blocks);
+  for (size_t i = 1; i <= valid_blocks; i++) {
+    int is_last = (i == valid_blocks);
 
     int is_consec = !is_last && (pairs[i].master_block_index ==
                                  pairs[i - 1].master_block_index + 1);
@@ -136,7 +145,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
       ssize_t res = pread(masterFd, dst, BLOCK_SIZE, min_master * BLOCK_SIZE);
       if (res != BLOCK_SIZE) {
         free(master_buf);
-        return -1;
+        return -EIO;
       }
     } else {
       size_t read_size = blocks_in_group * BLOCK_SIZE;
@@ -144,7 +153,7 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
           pread(masterFd, master_buf, read_size, min_master * BLOCK_SIZE);
       if (res != (ssize_t)read_size) {
         free(master_buf);
-        return -1;
+        return -EIO;
       }
       // Phase 5: Copy each block to correct position in output
       for (size_t j = group_start; j < i; j++) {
@@ -158,7 +167,8 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
     group_start = i;
   }
   free(master_buf);
-  return size;
+  // Devolve bytes lidos (pode ser < size se o caller pediu além do EOF).
+  return (int)(valid_blocks * BLOCK_SIZE);
 }
 
 // -----------------------------------------------------------------------------
