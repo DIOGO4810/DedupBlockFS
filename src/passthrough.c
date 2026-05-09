@@ -175,7 +175,7 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
   // (xmp_unlink). Copiamos o valor para a stack antes de libertar o
   // lock, porque o ponteiro retornado pode ser invalidado por um remove
   // posterior.
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   size_t *size_pointer = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   size_t logical_size = 0;
   int has_size = 0;
@@ -183,7 +183,7 @@ static int xmp_getattr(const char *path, struct stat *stbuf,
     logical_size = *size_pointer;
     has_size = 1;
   }
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   if (has_size) {
     stbuf->st_size = logical_size;
@@ -268,7 +268,11 @@ static int xmp_unlink(const char *path) {
   //         gettid(), path, f_ctx->uid, f_ctx->pid);
 #endif
 
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // Write lock — vamos modificar metadata (file_to_master via
+  // remove_block_dedup, hash_to_master, file_to_sizes). Commit 4
+  // refactoriza isto para batch (remove_blocks_dedup_batch); por
+  // agora mantém-se em loop sob write lock.
+  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL) {
     // walk through every block of the file and remove its reference
@@ -279,7 +283,7 @@ static int xmp_unlink(const char *path) {
     // remove the file size entry itself
     g_hash_table_remove(p_ctx->index->file_to_sizes, path);
   }
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   // now actually delete the file
   int res = unlink(path);
@@ -372,7 +376,9 @@ static int xmp_truncate(const char *path, off_t size,
   struct fuse_context *f_ctx = fuse_get_context();
   Context *p_ctx = (Context *)f_ctx->private_data;
 
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // Write lock para remove_block_dedup e update do logical_size.
+  // Commit 4 refactoriza para batch.
+  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
   size_t *logical_size = g_hash_table_lookup(p_ctx->index->file_to_sizes, path);
   if (logical_size != NULL && (size_t)size < *logical_size) {
     // only the blocks past the new size need to be removed
@@ -383,7 +389,7 @@ static int xmp_truncate(const char *path, off_t size,
     }
     *logical_size = size;
   }
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   int res;
   if (fi != NULL)
@@ -487,11 +493,14 @@ static int xmp_read(const char *path, char *buf, size_t size, off_t offset,
   if (fd == -1)
     return -errno;
 
-  // read from the master file through the dedup layer
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // read from the master file through the dedup layer.
+  // Read lock — múltiplos leitores podem coexistir; só compete com
+  // writers (write_dedup, unlink, truncate).
+  // Commit 3 vai mover a fase de pread para fora do lock.
+  pthread_rwlock_rdlock(&p_ctx->index->metadata_rwlock);
   int total_read =
       read_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd);
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   if (fi == NULL)
     close(fd);
@@ -530,11 +539,14 @@ static int xmp_write(const char *path, const char *buf, size_t size,
   if (fd == -1)
     return -errno;
 
-  // write through the dedup layer (handles dedup + overwrite)
-  pthread_mutex_lock(&p_ctx->index->mutex);
+  // write through the dedup layer.
+  // Por enquanto pega-se write lock à volta de tudo; Commit 3 vai
+  // dividir o lock em fases (Passe 1 read, Passe 2 sem lock, Passe 3
+  // write) para extrair paralelismo real.
+  pthread_rwlock_wrlock(&p_ctx->index->metadata_rwlock);
   res = write_dedup(p_ctx->index, path, buf, size, offset, p_ctx->masterFd,
                     &p_ctx->nextBlockIndex);
-  pthread_mutex_unlock(&p_ctx->index->mutex);
+  pthread_rwlock_unlock(&p_ctx->index->metadata_rwlock);
 
   if (fi == NULL)
     close(fd);

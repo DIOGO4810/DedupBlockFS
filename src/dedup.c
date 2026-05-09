@@ -155,20 +155,31 @@ int read_dedup(Index *index, const char *path, char *buf, size_t size,
 // Remove single-block reference. Usado por xmp_unlink/xmp_truncate em loop.
 // -----------------------------------------------------------------------------
 
+// PRECONDITION: caller deve segurar metadata_rwlock em write mode.
+// O cleanup do MasterInfo (quando refcount cai a 0) tem de acontecer
+// sob write lock para excluir leitores que ainda possam ter o ponteiro.
 void remove_block_dedup(Index *index, const char *path, uint64_t blockIndex) {
   MasterInfo *info = lookup_by_file_block(index, path, blockIndex);
   if (info == NULL)
     return;
 
   remove_file_block(index, path, blockIndex);
-  info->refcount--;
 
-  // Se mais ninguém referencia este bloco, devolve o slot ao topo da
-  // free list (LIFO, O(1) em prepend).
-  if (info->refcount == 0) {
+  // fetch_sub atómico para coordenar com increments paralelos sob read
+  // lock. ACQ_REL: RELEASE garante que escritas anteriores ao info
+  // ficam visíveis se for cleanup; ACQUIRE garante que vemos estado
+  // estabilizado se ganharmos a corrida ao 0.
+  // Se fetch_sub retornar 1, o valor antes do dec era 1, agora é 0 —
+  // somos o último a soltar a referência.
+  if (__atomic_fetch_sub(&info->refcount, 1, __ATOMIC_ACQ_REL) == 1) {
+    // Devolve o slot à free list. Pega freelist_mutex isoladamente
+    // (já temos metadata_rwlock em wr; ordem hierárquica respeitada:
+    // metadata > freelist).
     uint64_t *slot = malloc(sizeof(uint64_t));
     *slot = info->masterBlockIndex;
+    pthread_mutex_lock(&index->freelist_mutex);
     index->free_block_list = g_slist_prepend(index->free_block_list, slot);
+    pthread_mutex_unlock(&index->freelist_mutex);
 
     remove_hash(index, info->hash);
     free(info);
@@ -325,7 +336,9 @@ static void rollback_allocations(Index *idx, PlanEntry *plan, size_t n) {
   // no caminho dos MISSes.
   for (size_t i = 0; i < n; i++) {
     if (plan[i].kind == PLAN_HIT) {
-      plan[i].info->refcount--;
+      // Atomic decrement para reverter o increment do Passe 1.
+      // RELAXED: counter puro, sem ordering com mais nada.
+      __atomic_fetch_sub(&plan[i].info->refcount, 1, __ATOMIC_RELAXED);
     }
   }
 
@@ -405,15 +418,19 @@ int write_dedup(Index *index, const char *path, const char *buf, size_t size,
     if (existing != NULL) {
       // HIT: o conteúdo já existe (ou no índice ou neste mesmo batch).
       // Aumenta o refcount; o MasterInfo é partilhado.
+      // Atomic com RELAXED: o lock que segura o caller (read lock) já
+      // garante visibilidade do MasterInfo; o increment é counter puro.
       plan[i].kind = PLAN_HIT;
       plan[i].info = existing;
-      existing->refcount++;
+      __atomic_fetch_add(&existing->refcount, 1, __ATOMIC_RELAXED);
     } else {
       // MISS: novo conteúdo. Cria-se o MasterInfo mas NÃO se insere em
       // hash_to_master ainda — só após o flush bem-sucedido (Passe 3).
       MasterInfo *info = g_new(MasterInfo, 1);
       memcpy(info->hash, plan[i].hash, HASH_SIZE);
-      info->refcount = 1;
+      // Init não-atómico OK: este info ainda não foi publicado em
+      // hash_to_master, ninguém mais o vê.
+      atomic_store_explicit(&info->refcount, 1, memory_order_relaxed);
       info->masterBlockIndex = 0;  // preenchido na fase de alocação abaixo
 
       plan[i].kind = PLAN_MISS;
