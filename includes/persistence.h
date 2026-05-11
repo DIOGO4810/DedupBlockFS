@@ -6,10 +6,23 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <unistd.h>
+
+#define BUFFER_SIZE 10485760  // 10MB buffer for I/O operations
+
 typedef struct {
   void *data;
   size_t size;
 } Bytes;
+
+// Unified buffered I/O context for both reading and writing
+typedef struct {
+  int fd;
+  uint8_t *buffer;
+  size_t buffer_size;
+  size_t buffer_pos;     // Current position in buffer
+  size_t buffer_end;     // Valid data end (for reads) or buffer fill level (for writes)
+  off_t file_offset;
+} BufferedIOCtx;
 
 typedef Bytes (*EncodeFunc)(void *elem);
 typedef void *(*DecodeFunc)(void *data, int size);
