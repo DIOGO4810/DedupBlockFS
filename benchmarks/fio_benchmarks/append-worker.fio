@@ -1,0 +1,12 @@
+[global]
+ioengine=psync
+direct=0
+group_reporting=1
+randrepeat=1
+
+[appendWriter]
+rw=write
+file_append=1
+create_on_open=1
+numjobs=1
+bssplit=4k/60:16k/25:64k/15
