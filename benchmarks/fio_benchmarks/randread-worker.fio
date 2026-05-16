@@ -1,0 +1,12 @@
+[global]
+ioengine=psync
+direct=0
+time_based=1
+group_reporting=1
+
+[randReader]
+rw=randread
+create_on_open=0
+numjobs=1
+bssplit=4k/60:16k/25:64k/15
+blockalign=4k 
