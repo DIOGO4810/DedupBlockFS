@@ -1,12 +1,32 @@
 #include "persistence.h"
 #include <stddef.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+// Unified buffered I/O context for both reading and writing
+typedef struct {
+  int fd;
+  uint8_t *buffer;
+  size_t buffer_size;
+  size_t buffer_pos; // Current position in buffer
+  size_t buffer_end; // Valid data end (for reads) or buffer fill level (for
+                     // writes)
+  off_t file_offset;
+} BufferedIOCtx;
+
 static BufferedIOCtx *buffered_io_init(int fd, size_t buffer_size) {
   BufferedIOCtx *ctx = malloc(sizeof(BufferedIOCtx));
-  ctx->fd = fd;
+  if (ctx == NULL)
+    return NULL;
+
   ctx->buffer = malloc(buffer_size);
+  if (ctx->buffer == NULL) {
+    free(ctx);
+    return NULL;
+  }
+
+  ctx->fd = fd;
   ctx->buffer_size = buffer_size;
   ctx->buffer_pos = 0;
   ctx->buffer_end = 0;
@@ -31,6 +51,13 @@ static void flush_write_buffer(BufferedIOCtx *ctx) {
   if (written == (ssize_t)ctx->buffer_pos) {
     ctx->file_offset += ctx->buffer_pos;
     ctx->buffer_pos = 0;
+  } else if (written > 0) {
+    ctx->file_offset += (size_t)written;
+    size_t remaining = ctx->buffer_pos - (size_t)written;
+    memmove(ctx->buffer, ctx->buffer + written, remaining);
+    ctx->buffer_pos = remaining;
+  } else {
+    perror("flush_write_buffer failed");
   }
 }
 
@@ -227,6 +254,10 @@ static void save_values_array(const char *path, GArray *values,
     return;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return;
+  }
 
   int n = values->len;
   buffered_write(io_ctx, &n, sizeof(n));
@@ -248,6 +279,10 @@ static GArray *load_values_array(const char *path, DecodeFunc decode_value) {
     return values;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return values;
+  }
 
   int n = 0;
   if (!buffered_read(io_ctx, &n, sizeof(n))) {
@@ -276,6 +311,10 @@ void ghash_save(const char *path, GHashTable *ht, EncodeFunc encode_key,
     return;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return;
+  }
 
   int n = g_hash_table_size(ht);
   buffered_write(io_ctx, &n, sizeof(n));
@@ -298,6 +337,10 @@ GHashTable *ghash_load(const char *path, GHashFunc hash_fn, GEqualFunc equal_fn,
     return ht;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return ht;
+  }
 
   int n = 0;
   if (buffered_read(io_ctx, &n, sizeof(n))) {
@@ -327,33 +370,53 @@ void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
   g_hash_table_foreach(table1, collect_value_index, &values_ctx);
   g_hash_table_foreach(table2, collect_value_index, &values_ctx);
 
-  save_values_array(values_path, values, encode_value);
-
   int fd1 = open(table1_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
-  if (fd1 >= 0) {
-    BufferedIOCtx *io_ctx = buffered_io_init(fd1, BUFFER_SIZE);
-    int n = g_hash_table_size(table1);
-    buffered_write(io_ctx, &n, sizeof(n));
-    SaveIndexedCtx ctx = {io_ctx, config1.encode_key, config1.free_encoded_key,
-                          value_to_index};
-    g_hash_table_foreach(table1, save_indexed_entry, &ctx);
-    flush_write_buffer(io_ctx);
-    buffered_io_free(io_ctx);
-    close(fd1);
+  if (fd1 < 0) {
+    g_array_free(values, TRUE);
+    g_hash_table_destroy(value_to_index);
+    return;
   }
 
   int fd2 = open(table2_path, O_WRONLY | O_CREAT | O_TRUNC | O_SYNC, 0644);
-  if (fd2 >= 0) {
-    BufferedIOCtx *io_ctx = buffered_io_init(fd2, BUFFER_SIZE);
-    int n = g_hash_table_size(table2);
-    buffered_write(io_ctx, &n, sizeof(n));
-    SaveIndexedCtx ctx = {io_ctx, config2.encode_key, config2.free_encoded_key,
-                          value_to_index};
-    g_hash_table_foreach(table2, save_indexed_entry, &ctx);
-    flush_write_buffer(io_ctx);
-    buffered_io_free(io_ctx);
-    close(fd2);
+  if (fd2 < 0) {
+    close(fd1);
+    g_array_free(values, TRUE);
+    g_hash_table_destroy(value_to_index);
+    return;
   }
+
+  BufferedIOCtx *io_ctx1 = buffered_io_init(fd1, BUFFER_SIZE);
+  BufferedIOCtx *io_ctx2 = buffered_io_init(fd2, BUFFER_SIZE);
+  if (io_ctx1 == NULL || io_ctx2 == NULL) {
+    buffered_io_free(io_ctx1);
+    buffered_io_free(io_ctx2);
+    close(fd1);
+    close(fd2);
+    g_array_free(values, TRUE);
+    g_hash_table_destroy(value_to_index);
+    return;
+  }
+
+  save_values_array(values_path, values, encode_value);
+
+  int n1 = g_hash_table_size(table1);
+  buffered_write(io_ctx1, &n1, sizeof(n1));
+  SaveIndexedCtx ctx1 = {io_ctx1, config1.encode_key, config1.free_encoded_key,
+                         value_to_index};
+  g_hash_table_foreach(table1, save_indexed_entry, &ctx1);
+  flush_write_buffer(io_ctx1);
+
+  int n2 = g_hash_table_size(table2);
+  buffered_write(io_ctx2, &n2, sizeof(n2));
+  SaveIndexedCtx ctx2 = {io_ctx2, config2.encode_key, config2.free_encoded_key,
+                         value_to_index};
+  g_hash_table_foreach(table2, save_indexed_entry, &ctx2);
+  flush_write_buffer(io_ctx2);
+
+  buffered_io_free(io_ctx1);
+  buffered_io_free(io_ctx2);
+  close(fd1);
+  close(fd2);
 
   g_array_free(values, TRUE);
   g_hash_table_destroy(value_to_index);
@@ -420,6 +483,10 @@ void gslist_save(const char *path, GSList *list, EncodeFunc encode_elem) {
     return;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return;
+  }
 
   int n = g_slist_length(list);
   buffered_write(io_ctx, &n, sizeof(n));
@@ -439,6 +506,10 @@ GSList *gslist_load(const char *path, DecodeFunc decode_elem) {
     return NULL;
 
   BufferedIOCtx *io_ctx = buffered_io_init(fd, BUFFER_SIZE);
+  if (io_ctx == NULL) {
+    close(fd);
+    return NULL;
+  }
 
   int n = 0;
   if (!buffered_read(io_ctx, &n, sizeof(n))) {
