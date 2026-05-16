@@ -6,6 +6,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <unistd.h>
+
+#define BUFFER_SIZE 10485760 // 10MB buffer for I/O operations
+
 typedef struct {
   void *data;
   size_t size;
@@ -28,12 +31,12 @@ typedef struct {
 
 typedef struct {
   EncodeFunc encode_key;
-  gboolean free_encoded_key;  // Set TRUE if encode_key allocates memory
+  gboolean free_encoded_key; // Set TRUE if encode_key allocates memory
 } IndexedTableSaveConfig;
 
 // Save a regular hash table. Set free_encoded_key/val TRUE if the corresponding
-// encoder allocates memory (e.g., encode_block_indice). Allocated memory will be
-// freed automatically after encoding each entry.
+// encoder allocates memory (e.g., encode_block_indice). Allocated memory will
+// be freed automatically after encoding each entry.
 void ghash_save(const char *path, GHashTable *ht, EncodeFunc encode_key,
                 EncodeFunc encode_val, gboolean free_encoded_key,
                 gboolean free_encoded_val);
@@ -46,15 +49,15 @@ GHashTable *ghash_load(const char *path, GHashFunc hash_fn, GEqualFunc equal_fn,
 // free_encoded_key TRUE if the corresponding encoder allocates memory.
 void ghash_save_indexed_pair(const char *table1_path, const char *table2_path,
                              const char *values_path, GHashTable *table1,
-                             GHashTable *table2,
-                             IndexedTableSaveConfig config1,
+                             GHashTable *table2, IndexedTableSaveConfig config1,
                              IndexedTableSaveConfig config2,
                              EncodeFunc encode_value);
 
-IndexedPairTables ghash_load_indexed_pair(
-    const char *table1_path, const char *table2_path, const char *values_path,
-    IndexedTableLoadConfig config1, IndexedTableLoadConfig config2,
-    DecodeFunc decode_value, GDestroyNotify free_value);
+IndexedPairTables
+ghash_load_indexed_pair(const char *table1_path, const char *table2_path,
+                        const char *values_path, IndexedTableLoadConfig config1,
+                        IndexedTableLoadConfig config2, DecodeFunc decode_value,
+                        GDestroyNotify free_value);
 
 // Persistência da free list: lista de slots livres como uint64_t individuais.
 void gslist_save(const char *path, GSList *list, EncodeFunc encode_elem);
