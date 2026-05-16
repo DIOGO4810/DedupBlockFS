@@ -9,21 +9,24 @@ Description:
   Runs fio workloads for writes or reads.
   The chosen mode uses its own file set.
   Results are written to a PID-specific directory.
+  Note: --runtime only affects reads mode; writes are size-based.
 
 Flags:
   --jobs=N          Number of worker files. Default: 4
   --dedup=PERCENT   Write dedupe percentage for fio. Default: 0
-  --runtime=SECONDS Runtime in seconds for fio jobs. Default: 60
+  --runtime=SECONDS Runtime in seconds for read fio jobs. Ignored for writes.
+                    Default: 60
   --size=SIZE       Total size to split across jobs.
                     Each fio job gets SIZE / jobs.
                     Example: 50M, 2G. Default: 50M
   --mode=...        writes or reads. Default: writes
+                    writes are size-based; reads honor --runtime
   -h, --help        Show this help
 
 Examples:
   $0
   $0 --mode=reads --jobs=8 --runtime=120 --size=500M
-  $0 --mode=writes --jobs=8 --dedup=25 --runtime=120 --size=500M
+  $0 --mode=writes --jobs=8 --dedup=25 --size=500M
 EOF
 }
 
