@@ -4,6 +4,7 @@ passthrough
 build
 .vscode/c_cpp_properties.json
 *.md
+!README.md
 !docs/*.md
 .claude
 *.o
